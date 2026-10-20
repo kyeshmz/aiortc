@@ -1233,6 +1233,90 @@ class RTCSctpTransportTest(TestCase):
                 self.assertIsNone(client._t1_handle)
 
     @asynctest
+    async def test_half_range_data_is_ignored_before_reassembly(self) -> None:
+        for initial_tsn in (0, 0x80000000, 0xFFFFFFFE):
+            for flags in (
+                SCTP_DATA_FIRST_FRAG,
+                SCTP_DATA_FIRST_FRAG | SCTP_DATA_LAST_FRAG,
+            ):
+                with self.subTest(initial_tsn=initial_tsn, flags=flags):
+                    async with client_and_server() as (client, server):
+                        client._local_tsn = initial_tsn
+                        local = RTCDataChannel(
+                            client,
+                            RTCDataChannelParameters(
+                                label="chat", negotiated=True, id=0
+                            ),
+                        )
+                        remote = RTCDataChannel(
+                            server,
+                            RTCDataChannelParameters(
+                                label="chat", negotiated=True, id=0
+                            ),
+                        )
+                        received: asyncio.Queue[str] = asyncio.Queue()
+                        messages: list[str] = []
+                        remote.on("message", received.put_nowait)
+                        remote.on("message", messages.append)
+                        await server.start(client.getCapabilities(), client.port)
+                        await client.start(server.getCapabilities(), server.port)
+                        await wait_for_outcome(client, server)
+                        local.send("seed")
+                        self.assertEqual(
+                            await asyncio.wait_for(received.get(), 1), "seed"
+                        )
+
+                        stream = server._inbound_streams[0]
+                        before_tsn = server._last_received_tsn
+                        before_window = server._advertised_rwnd
+                        before_sequence = stream.sequence_number
+                        chunk = DataChunk(flags=flags)
+                        chunk.tsn = (before_tsn + 0x80000000) % 0x100000000
+                        chunk.stream_id = 0
+                        chunk.stream_seq = before_sequence
+                        chunk.protocol = 51
+                        chunk.user_data = b"ambiguous"
+                        packet = serialize_packet(
+                            client.port,
+                            server.port,
+                            server._local_verification_tag,
+                            chunk,
+                        )
+                        with patch.object(
+                            server.transport,
+                            "_send_data",
+                            wraps=server.transport._send_data,
+                        ) as send:
+                            await server._handle_data(packet)
+                            await server._handle_data(packet)
+                        self.assertEqual(messages, ["seed"])
+                        self.assertEqual(server._last_received_tsn, before_tsn)
+                        self.assertEqual(server._advertised_rwnd, before_window)
+                        self.assertEqual(server._sack_misordered, set())
+                        self.assertEqual(server._sack_duplicates, [])
+                        self.assertEqual(stream.reassembly, [])
+                        self.assertEqual(stream.sequence_number, before_sequence)
+                        self.assertTrue(received.empty())
+                        send.assert_not_awaited()
+
+                        local.send("valid")
+                        local.send("following")
+                        self.assertEqual(
+                            await asyncio.wait_for(received.get(), 1), "valid"
+                        )
+                        self.assertEqual(
+                            await asyncio.wait_for(received.get(), 1), "following"
+                        )
+                        self.assertTrue(received.empty())
+                        self.assertEqual(messages, ["seed", "valid", "following"])
+                        self.assertEqual(
+                            server._last_received_tsn,
+                            (initial_tsn + 2) % 0x100000000,
+                        )
+                        self.assertEqual(server._advertised_rwnd, before_window)
+                        self.assertEqual(stream.reassembly, [])
+
+    @asynctest
     async def test_unknown_reconfig_parameter_does_not_hide_stream_add(self) -> None:
         async with client_and_server() as (client, server):
             client._outbound_streams_count = 16
