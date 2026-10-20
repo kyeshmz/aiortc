@@ -1230,6 +1230,102 @@ class RTCSctpTransportTest(TestCase):
                 self.assertIsNone(client._t3_handle)
 
     @asynctest
+    async def test_abandoned_fragments_late_ack_preserves_other_flight_bytes(
+        self,
+    ) -> None:
+        for gap_ack in (False, True):
+            with self.subTest(gap_ack=gap_ack):
+                async with client_and_server() as (client, server):
+                    client._local_tsn = 1
+                    client._last_sacked_tsn = 0
+                    client._advanced_peer_ack_tsn = 0
+                    server._advertised_rwnd = 131072
+                    reliable = RTCDataChannel(
+                        client,
+                        RTCDataChannelParameters(
+                            label="reliable", negotiated=True, id=102
+                        ),
+                    )
+                    remote_reliable = RTCDataChannel(
+                        server,
+                        RTCDataChannelParameters(
+                            label="reliable", negotiated=True, id=102
+                        ),
+                    )
+                    local = RTCDataChannel(
+                        client,
+                        RTCDataChannelParameters(
+                            label="partial", negotiated=True, id=100, maxRetransmits=0
+                        ),
+                    )
+                    remote = RTCDataChannel(
+                        server,
+                        RTCDataChannelParameters(
+                            label="partial", negotiated=True, id=100
+                        ),
+                    )
+                    received: asyncio.Queue[bytes] = asyncio.Queue()
+                    remote_reliable.on("message", received.put_nowait)
+                    remote.on("message", received.put_nowait)
+                    await server.start(client.getCapabilities(), client.port)
+                    await client.start(server.getCapabilities(), server.port)
+                    await wait_for_outcome(client, server)
+                    with (
+                        patch.object(
+                            client.transport, "_send_data", new_callable=AsyncMock
+                        ) as tx,
+                        patch.object(
+                            server.transport, "_send_data", new_callable=AsyncMock
+                        ) as rx,
+                    ):
+                        reliable.send(b"P" * 1160)
+                        local.send(b"M" * 8120)
+                        local.send(b"after")
+                        await asyncio.sleep(0)
+                        for index in range(2, 5):
+                            await server._handle_data(tx.await_args_list[index].args[0])
+                            await client._handle_data(rx.await_args.args[0])
+                        self.assertEqual(
+                            [call.args[0][12:] for call in tx.await_args_list[5:]],
+                            [
+                                bytes.fromhex("00030498000000010066000000000035")
+                                + b"P" * 1160,
+                                bytes.fromhex("00030015000000090064000100000035")
+                                + b"after\x00\x00\x00",
+                            ],
+                        )
+                        self.assertEqual(client._flight_size, 1165)
+                        self.assertEqual(client._advanced_peer_ack_tsn, 0)
+                        await server._handle_data(tx.await_args_list[1].args[0])
+                        if gap_ack:
+                            await client._handle_data(rx.await_args.args[0])
+                            self.assertEqual(client._flight_size, 1165)
+                        await server._handle_data(tx.await_args_list[5].args[0])
+                        await client._handle_data(rx.await_args.args[0])
+                        self.assertEqual(client._flight_size, 5)
+                        self.assertEqual(
+                            [call.args[0][12:] for call in tx.await_args_list[7:]],
+                            [bytes.fromhex("c000000c0000000800640000")],
+                        )
+                        await server._handle_data(tx.await_args_list[7].args[0])
+                        await client._handle_data(rx.await_args.args[0])
+                        self.assertEqual(client._flight_size, 5)
+                        self.assertEqual(server._advertised_rwnd, 131072)
+                        await server._handle_data(tx.await_args_list[6].args[0])
+                        await client._handle_data(rx.await_args.args[0])
+                        self.assertEqual(
+                            [await received.get(), await received.get()],
+                            [b"P" * 1160, b"after"],
+                        )
+                        self.assertTrue(received.empty())
+                        self.assertEqual(client._last_sacked_tsn, 9)
+                        self.assertEqual(client._flight_size, 0)
+                        self.assertEqual(outstanding_tsns(client), [])
+                        self.assertEqual(queued_tsns(client), [])
+                        self.assertEqual(local.bufferedAmount, 0)
+                        self.assertIsNone(client._t3_handle)
+
+    @asynctest
     async def test_fast_abandon_sends_forward_tsn_without_restarting_t3(self) -> None:
         async with client_and_server() as (client, server):
             client._local_tsn = 1
