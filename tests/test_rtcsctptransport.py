@@ -671,6 +671,239 @@ class SctpUtilTest(TestCase):
 
 class RTCSctpTransportTest(TestCase):
     @asynctest
+    async def test_unknown_reconfig_parameter_does_not_hide_stream_add(self) -> None:
+        async with client_and_server() as (client, server):
+            client._outbound_streams_count = 16
+            local = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=0)
+            )
+            remote = RTCDataChannel(
+                server, RTCDataChannelParameters(label="chat", negotiated=True, id=0)
+            )
+            received: asyncio.Queue[str] = asyncio.Queue()
+            remote.on("message", received.put_nowait)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            self.assertEqual(server.maxChannels, 16)
+
+            chunk = ReconfigChunk()
+            chunk.params = [
+                (0xFFFF, b"extension"),
+                (17, bytes(StreamAddOutgoingParam(request_sequence=42, new_streams=2))),
+            ]
+            with patch.object(
+                server.transport, "_send_data", wraps=server.transport._send_data
+            ) as send:
+                await server._handle_data(
+                    serialize_packet(
+                        client.port, server.port, server._local_verification_tag, chunk
+                    )
+                )
+                self.assertEqual(server.maxChannels, 18)
+                self.assertEqual(
+                    [call.args[0][12:] for call in send.await_args_list],
+                    [bytes.fromhex("820000100010000c0000002a00000001")],
+                )
+            local.send("after reconfiguration")
+            self.assertEqual(
+                await asyncio.wait_for(received.get(), 1), "after reconfiguration"
+            )
+            self.assertTrue(received.empty())
+
+    @asynctest
+    async def test_duplicate_cookie_echo_keeps_open_channels_usable(self) -> None:
+        async with client_and_server() as (client, server):
+            local = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            remote = RTCDataChannel(
+                server, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            ordinary = RTCDataChannel(server, RTCDataChannelParameters(label="in-band"))
+            opened = MagicMock()
+            remote.on("open", opened)
+            received: asyncio.Queue[str] = asyncio.Queue()
+            remote.on("message", received.put_nowait)
+            with patch.object(
+                client.transport, "_send_data", wraps=client.transport._send_data
+            ) as send:
+                await server.start(client.getCapabilities(), client.port)
+                await client.start(server.getCapabilities(), server.port)
+                await wait_for_outcome(client, server)
+                await asyncio.sleep(0.1)
+                echoes = [
+                    call.args[0]
+                    for call in send.await_args_list
+                    if call.args[0][12] == 10
+                ]
+            self.assertEqual(len(echoes), 1)
+            self.assertEqual(ordinary.readyState, "open")
+            opened.assert_called_once_with()
+            with patch.object(
+                server.transport, "_send_data", wraps=server.transport._send_data
+            ) as send:
+                await server._handle_data(echoes[0])
+                self.assertEqual(
+                    [call.args[0][12:] for call in send.await_args_list],
+                    [b"\x0b\x00\x00\x04"],
+                )
+            self.assertEqual(remote.readyState, "open")
+            self.assertEqual(ordinary.readyState, "open")
+            opened.assert_called_once_with()
+            local.send("after duplicate cookie")
+            self.assertEqual(
+                await asyncio.wait_for(received.get(), 1), "after duplicate cookie"
+            )
+            self.assertTrue(received.empty())
+
+    @asynctest
+    async def test_abandon_fragment_after_first_fragment_acknowledged(self) -> None:
+        async with client_and_server() as (client, server):
+            client._local_tsn = 1
+            server._advertised_rwnd = 131072
+            local = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(
+                    label="chat", negotiated=True, id=100, maxRetransmits=0
+                ),
+            )
+            remote = RTCDataChannel(
+                server, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            received: asyncio.Queue[bytes] = asyncio.Queue()
+            remote.on("message", received.put_nowait)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+
+            with (
+                patch.object(
+                    client.transport, "_send_data", new_callable=AsyncMock
+                ) as tx,
+                patch.object(
+                    server.transport, "_send_data", new_callable=AsyncMock
+                ) as rx,
+            ):
+                local.send(b"M" * 2320)
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    [call.args[0][12:] for call in tx.await_args_list],
+                    [
+                        bytes.fromhex("00020498000000010064000000000035") + b"M" * 1160,
+                        bytes.fromhex("00010498000000020064000000000035") + b"M" * 1160,
+                    ],
+                )
+                await server._handle_data(tx.await_args_list[0].args[0])
+                self.assertEqual(
+                    rx.await_args.args[0][12:],
+                    bytes.fromhex("03000010000000010001fb7800000000"),
+                )
+                await client._handle_data(rx.await_args.args[0])
+                client._t3_cancel()
+                client._t3_expired()
+                await asyncio.sleep(0)
+                self.assertEqual(tx.await_count, 3)
+                self.assertEqual(
+                    tx.await_args.args[0][12:],
+                    bytes.fromhex("c000000c0000000200640000"),
+                )
+                await server._handle_data(tx.await_args.args[0])
+                self.assertEqual(
+                    rx.await_args.args[0][12:],
+                    bytes.fromhex("03000010000000020002000000000000"),
+                )
+                await client._handle_data(rx.await_args.args[0])
+                self.assertTrue(received.empty())
+                local.send(b"after")
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    tx.await_args.args[0][12:],
+                    bytes.fromhex("00030015000000030064000100000035")
+                    + b"after\x00\x00\x00",
+                )
+                await server._handle_data(tx.await_args.args[0])
+                self.assertEqual(await asyncio.wait_for(received.get(), 1), b"after")
+                self.assertTrue(received.empty())
+
+    @asynctest
+    async def test_fast_abandon_sends_forward_tsn_without_restarting_t3(self) -> None:
+        async with client_and_server() as (client, server):
+            client._local_tsn = 1
+            server._advertised_rwnd = 131072
+            lost = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(
+                    label="unreliable", negotiated=True, id=100, maxRetransmits=0
+                ),
+            )
+            remote_lost = RTCDataChannel(
+                server,
+                RTCDataChannelParameters(label="unreliable", negotiated=True, id=100),
+            )
+            reliable = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(label="reliable", negotiated=True, id=102),
+            )
+            remote_reliable = RTCDataChannel(
+                server,
+                RTCDataChannelParameters(label="reliable", negotiated=True, id=102),
+            )
+            received: asyncio.Queue[bytes] = asyncio.Queue()
+            remote_lost.on("message", received.put_nowait)
+            remote_reliable.on("message", received.put_nowait)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+
+            with (
+                patch.object(
+                    client.transport, "_send_data", new_callable=AsyncMock
+                ) as tx,
+                patch.object(
+                    server.transport, "_send_data", new_callable=AsyncMock
+                ) as rx,
+            ):
+                lost.send(b"X" * 1160)
+                for payload in (b"A", b"B", b"C"):
+                    reliable.send(payload * 1160)
+                await asyncio.sleep(0)
+                timer = client._t3_handle
+                self.assertIsNotNone(timer)
+                self.assertEqual(tx.await_count, 3)
+                for index in range(1, 4):
+                    await server._handle_data(tx.await_args_list[index].args[0])
+                    self.assertEqual(
+                        rx.await_args.args[0][12:],
+                        bytes.fromhex("030000140000000000020000000100000002")
+                        + (index + 1).to_bytes(2, "big"),
+                    )
+                    await client._handle_data(rx.await_args.args[0])
+                self.assertEqual(
+                    [call.args[0][12:] for call in tx.await_args_list],
+                    [
+                        bytes.fromhex("00030498000000010064000000000035") + b"X" * 1160,
+                        bytes.fromhex("00030498000000020066000000000035") + b"A" * 1160,
+                        bytes.fromhex("00030498000000030066000100000035") + b"B" * 1160,
+                        bytes.fromhex("00030498000000040066000200000035") + b"C" * 1160,
+                        bytes.fromhex("c000000c0000000100640000"),
+                    ],
+                )
+                self.assertIs(client._t3_handle, timer)
+                await server._handle_data(tx.await_args.args[0])
+                self.assertEqual(
+                    rx.await_args.args[0][12:],
+                    bytes.fromhex("03000010000000040002000000000000"),
+                )
+                await client._handle_data(rx.await_args.args[0])
+                self.assertIsNone(client._t3_handle)
+                self.assertEqual(
+                    [await asyncio.wait_for(received.get(), 1) for _ in range(3)],
+                    [b"A" * 1160, b"B" * 1160, b"C" * 1160],
+                )
+                self.assertTrue(received.empty())
+
+    @asynctest
     async def test_close_multiple_channels_repeatedly(self) -> None:
         async with client_and_server() as (client, server):
             await server.start(client.getCapabilities(), client.port)
