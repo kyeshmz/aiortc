@@ -4867,6 +4867,321 @@ a=rtpmap:0 PCMU/8000
         await pc2.close()
 
     @asynctest
+    async def test_setDescription_unsupported_media(self) -> None:
+        for is_local in (True, False):
+            for pending in (False, True):
+                with self.subTest(is_local=is_local, pending=pending):
+                    offerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                    answerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                    try:
+                        offerer.addTransceiver("audio")
+                        offerer.addTransceiver("video")
+                        offerer.createDataChannel("chat")
+                        offer = await offerer.createOffer()
+                        pc = offerer if is_local else answerer
+                        apply = (
+                            pc.setLocalDescription
+                            if is_local
+                            else pc.setRemoteDescription
+                        )
+                        if pending:
+                            await apply(offer)
+                        before_local = pc.localDescription
+                        before_remote = pc.remoteDescription
+                        before_transceivers = pc.getTransceivers()
+                        before_sctp = pc.sctp
+                        before_mids = [t.mid for t in before_transceivers]
+                        before_state = pc.signalingState
+                        states = track_states(pc)
+                        parsed = SessionDescription.parse(offer.sdp)
+                        parsed.media[1].kind = "message"
+                        with self.assertRaisesRegex(
+                            ValueError, "Unsupported media kind 'message'"
+                        ):
+                            await apply(
+                                RTCSessionDescription(sdp=str(parsed), type="offer")
+                            )
+                        self.assertEqual(pc.localDescription, before_local)
+                        self.assertEqual(pc.remoteDescription, before_remote)
+                        self.assertEqual(pc.getTransceivers(), before_transceivers)
+                        self.assertIs(pc.sctp, before_sctp)
+                        self.assertEqual(
+                            [t.mid for t in pc.getTransceivers()], before_mids
+                        )
+                        self.assertEqual(pc.signalingState, before_state)
+                        self.assertEqual(states["signalingState"], [before_state])
+                        await apply(offer)
+                        self.assertEqual(
+                            [
+                                m.kind
+                                for m in SessionDescription.parse(
+                                    (
+                                        pc.localDescription
+                                        if is_local
+                                        else pc.remoteDescription
+                                    ).sdp
+                                ).media
+                            ],
+                            ["audio", "video", "application"],
+                        )
+                        if not is_local:
+                            answer = await pc.createAnswer()
+                            self.assertEqual(
+                                [
+                                    m.kind
+                                    for m in SessionDescription.parse(answer.sdp).media
+                                ],
+                                ["audio", "video", "application"],
+                            )
+                    finally:
+                        await asyncio.gather(offerer.close(), answerer.close())
+
+    @asynctest
+    async def test_setDescription_rollback_is_unsupported(self) -> None:
+        for is_local in (True, False):
+            for pending in (False, True):
+                with self.subTest(is_local=is_local, pending=pending):
+                    offerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                    answerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                    try:
+                        pc = offerer if is_local else answerer
+                        pc.addTransceiver("video", direction="recvonly")
+                        pc.createDataChannel("chat")
+                        if pending:
+                            if not is_local:
+                                offerer.addTransceiver("video", direction="recvonly")
+                                offerer.createDataChannel("chat")
+                            await offerer.setLocalDescription(
+                                await offerer.createOffer()
+                            )
+                            if not is_local:
+                                await pc.setRemoteDescription(offerer.localDescription)
+                        transceivers = pc.getTransceivers()
+                        transports = [t.receiver.transport for t in transceivers]
+                        transports.append(pc.sctp.transport)
+                        before_local = pc.localDescription
+                        before_remote = pc.remoteDescription
+                        before_state = pc.signalingState
+                        before_mids = [t.mid for t in transceivers] + [pc.sctp.mid]
+                        before_parameters = [t.getLocalParameters() for t in transports]
+                        before_candidates = [
+                            t.transport.getRemoteCandidates() for t in transports
+                        ]
+                        states = track_states(pc)
+                        apply = (
+                            pc.setLocalDescription
+                            if is_local
+                            else pc.setRemoteDescription
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "Unsupported description type 'rollback'"
+                        ):
+                            await apply(RTCSessionDescription(sdp="", type="rollback"))
+                        self.assertEqual(pc.signalingState, before_state)
+                        self.assertEqual(states["signalingState"], [before_state])
+                        self.assertEqual(pc.localDescription, before_local)
+                        self.assertEqual(pc.remoteDescription, before_remote)
+                        self.assertEqual(pc.getTransceivers(), transceivers)
+                        self.assertEqual(
+                            [t.receiver.transport for t in transceivers]
+                            + [pc.sctp.transport],
+                            transports,
+                        )
+                        self.assertEqual(
+                            [t.mid for t in transceivers] + [pc.sctp.mid], before_mids
+                        )
+                        self.assertEqual([t.state for t in transports], ["new", "new"])
+                        self.assertEqual(
+                            [t.getLocalParameters() for t in transports],
+                            before_parameters,
+                        )
+                        self.assertEqual(
+                            [t.transport.getRemoteCandidates() for t in transports],
+                            before_candidates,
+                        )
+                    finally:
+                        await asyncio.gather(offerer.close(), answerer.close())
+
+    @asynctest
+    async def test_setDescription_unexpected_pranswer(self) -> None:
+        for is_local in (True, False):
+            for pending in (False, True):
+                with self.subTest(is_local=is_local, pending=pending):
+                    pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                    try:
+                        pc.addTransceiver("audio")
+                        offer = await pc.createOffer()
+                        if pending:
+                            if is_local:
+                                await pc.setLocalDescription(offer)
+                            else:
+                                await pc.setRemoteDescription(offer)
+                        state = pc.signalingState
+                        apply = (
+                            pc.setLocalDescription
+                            if is_local
+                            else pc.setRemoteDescription
+                        )
+                        with self.assertRaisesRegex(
+                            InvalidStateError,
+                            f'Cannot handle pranswer in signaling state "{state}"',
+                        ):
+                            await apply(RTCSessionDescription(sdp="", type="pranswer"))
+                        self.assertEqual(pc.signalingState, state)
+                    finally:
+                        await pc.close()
+
+    @asynctest
+    async def test_connect_video_pranswer(self) -> None:
+        for role in ("client", "server"):
+            with self.subTest(role=role):
+                offerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                answerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                try:
+                    offerer.addTrack(VideoStreamTrack())
+                    answerer.addTransceiver(VideoStreamTrack(), direction="sendonly")
+                    channel = offerer.createDataChannel("early")
+                    remote_channels = []
+                    messages: list[Union[str, bytes]] = []
+
+                    @answerer.on("datachannel")
+                    def on_datachannel(remote: RTCDataChannel) -> None:
+                        remote_channels.append(remote)
+                        remote.on("message", messages.append)
+
+                    for pc in (offerer, answerer):
+                        pc.getTransceivers()[0].setCodecPreferences(
+                            [
+                                c
+                                for c in RTCRtpSender.getCapabilities("video").codecs
+                                if c.mimeType in ("video/H265", "video/rtx")
+                            ]
+                        )
+                    offerer_states = track_states(offerer)
+                    answerer_states = track_states(answerer)
+                    offerer_tracks = track_remote_tracks(offerer)
+                    answerer_tracks = track_remote_tracks(answerer)
+                    observed = []
+
+                    @answerer.on("signalingstatechange")
+                    def observe_answerer() -> None:
+                        description = answerer.localDescription
+                        observed.append(
+                            (
+                                answerer.signalingState,
+                                description.type if description else None,
+                            )
+                        )
+
+                    await offerer.setLocalDescription(await offerer.createOffer())
+                    await answerer.setRemoteDescription(offerer.localDescription)
+                    parsed = SessionDescription.parse(
+                        (await answerer.createAnswer()).sdp
+                    )
+                    parsed.media[0].dtls.role = role
+                    parsed.media[1].dtls.role = role
+                    provisional = RTCSessionDescription(
+                        sdp=str(parsed), type="pranswer"
+                    )
+                    answerer.getTransceivers()[0].direction = "sendrecv"
+                    await answerer.setLocalDescription(provisional)
+                    self.assertEqual(answerer.signalingState, "have-local-pranswer")
+                    self.assertEqual(answerer.localDescription.type, "pranswer")
+                    self.assertEqual(
+                        answerer.getTransceivers()[0].currentDirection, "sendonly"
+                    )
+                    await offerer.setRemoteDescription(answerer.localDescription)
+                    self.assertEqual(offerer.signalingState, "have-remote-pranswer")
+                    self.assertEqual(offerer.remoteDescription.type, "pranswer")
+                    self.assertEqual(
+                        offerer.getTransceivers()[0].currentDirection, "recvonly"
+                    )
+                    self.assertEqual(len(offerer_tracks), 1)
+                    self.assertEqual(len(answerer_tracks), 1)
+                    frame = await asyncio.wait_for(offerer_tracks[0].recv(), timeout=10)
+                    assert isinstance(frame, VideoFrame)
+                    self.assertEqual((frame.width, frame.height), (640, 480))
+                    for pc in (offerer, answerer):
+                        self.assertEqual(pc.connectionState, "connected")
+                        self.assertEqual(
+                            pc.getSenders()[0].transport.state, "connected"
+                        )
+                    await self.assertDataChannelOpen(channel)
+                    self.assertEqual(len(remote_channels), 1)
+                    channel.send("provisional")
+                    await self.sleepWhile(lambda: not messages)
+                    self.assertEqual(messages, ["provisional"])
+                    await answerer.setLocalDescription(provisional)
+                    await offerer.setRemoteDescription(answerer.localDescription)
+                    await answerer.setLocalDescription()
+                    self.assertEqual(answerer.localDescription.type, "answer")
+                    self.assertEqual(
+                        SessionDescription.parse(answerer.localDescription.sdp)
+                        .media[0]
+                        .dtls.role,
+                        role,
+                    )
+                    await offerer.setRemoteDescription(answerer.localDescription)
+                    self.assertEqual(offerer.localDescription.type, "offer")
+                    self.assertEqual(answerer.remoteDescription.type, "offer")
+                    for pc in (offerer, answerer):
+                        self.assertEqual(pc.signalingState, "stable")
+                        self.assertEqual(
+                            pc.getTransceivers()[0].currentDirection, "sendrecv"
+                        )
+                        self.assertEqual(
+                            [
+                                c.mimeType
+                                for c in SessionDescription.parse(
+                                    pc.localDescription.sdp
+                                )
+                                .media[0]
+                                .rtp.codecs
+                            ],
+                            ["video/H265", "video/rtx"],
+                        )
+                    frames = await asyncio.gather(
+                        asyncio.wait_for(offerer_tracks[0].recv(), timeout=10),
+                        asyncio.wait_for(answerer_tracks[0].recv(), timeout=10),
+                    )
+                    for frame in frames:
+                        assert isinstance(frame, VideoFrame)
+                        self.assertEqual((frame.width, frame.height), (640, 480))
+                    channel.send("final")
+                    await self.sleepWhile(lambda: len(messages) < 2)
+                    self.assertEqual(messages, ["provisional", "final"])
+                    self.assertEqual(len(offerer_tracks), 1)
+                    self.assertEqual(len(answerer_tracks), 1)
+                    self.assertEqual(
+                        offerer_states["signalingState"],
+                        [
+                            "stable",
+                            "have-local-offer",
+                            "have-remote-pranswer",
+                            "stable",
+                        ],
+                    )
+                    self.assertEqual(
+                        answerer_states["signalingState"],
+                        [
+                            "stable",
+                            "have-remote-offer",
+                            "have-local-pranswer",
+                            "stable",
+                        ],
+                    )
+                    self.assertEqual(
+                        observed,
+                        [
+                            ("have-remote-offer", None),
+                            ("have-local-pranswer", "pranswer"),
+                            ("stable", "answer"),
+                        ],
+                    )
+                finally:
+                    await asyncio.gather(offerer.close(), answerer.close())
+
+    @asynctest
     async def test_setLocalDescription_implicit(self) -> None:
         pc = RTCPeerConnection()
         pc.addTrack(AudioStreamTrack())
