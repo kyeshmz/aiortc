@@ -1135,6 +1135,12 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Handle a DATA chunk.
         """
+        # Serial ordering is undefined at exactly half the TSN range (RFC 1982).
+        if (
+            chunk.tsn - self._last_received_tsn
+        ) % SCTP_TSN_MODULO == SCTP_TSN_MODULO // 2:
+            return
+
         self._sack_needed = True
 
         # mark as received
