@@ -361,7 +361,7 @@ class RTCIceTransport(AsyncIOEventEmitter):
     async def _monitor(self) -> None:
         while True:
             event = await self._connection.get_event()
-            if isinstance(event, ConnectionClosed):
+            if event is None or isinstance(event, ConnectionClosed):
                 if self.state == "completed":
                     self.__setState("failed")
                 return
