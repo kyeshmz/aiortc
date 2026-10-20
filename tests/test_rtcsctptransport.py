@@ -1073,6 +1073,338 @@ class RTCSctpTransportTest(TestCase):
                             self.assertIsNone(client._t3_handle)
 
     @asynctest
+    async def test_reset_retires_forward_tsn_skips_before_channel_reuse(self) -> None:
+        for close_from_sender in (True, False):
+            for pending, old_delivered in (
+                (True, False),
+                (False, False),
+                (False, True),
+            ):
+                with self.subTest(
+                    close_from_sender=close_from_sender,
+                    pending=pending,
+                    old_delivered=old_delivered,
+                ):
+                    async with client_and_server() as (client, server):
+                        client._local_tsn = 1
+                        client._last_sacked_tsn = 0
+                        client._advanced_peer_ack_tsn = 0
+                        local = RTCDataChannel(
+                            client,
+                            RTCDataChannelParameters(
+                                label="old", negotiated=True, id=100, maxRetransmits=0
+                            ),
+                        )
+                        remote = RTCDataChannel(
+                            server,
+                            RTCDataChannelParameters(
+                                label="old", negotiated=True, id=100
+                            ),
+                        )
+                        other = RTCDataChannel(
+                            client,
+                            RTCDataChannelParameters(
+                                label="other", negotiated=True, id=102, maxRetransmits=0
+                            ),
+                        )
+                        remote_other = RTCDataChannel(
+                            server,
+                            RTCDataChannelParameters(
+                                label="other", negotiated=True, id=102
+                            ),
+                        )
+                        received: list[bytes] = []
+                        remote_other.on("message", received.append)
+                        await server.start(client.getCapabilities(), client.port)
+                        await client.start(server.getCapabilities(), server.port)
+                        await wait_for_outcome(client, server)
+                        with (
+                            patch.object(
+                                client.transport, "_send_data", new_callable=AsyncMock
+                            ) as tx,
+                            patch.object(
+                                server.transport, "_send_data", new_callable=AsyncMock
+                            ) as rx,
+                        ):
+                            local.send(b"old")
+                            await asyncio.sleep(0)
+                            if not old_delivered:
+                                client._t3_cancel()
+                                client._t3_expired()
+                                await asyncio.sleep(0)
+                            old_packet = tx.await_args.args[0]
+                            self.assertEqual(
+                                old_packet[12:],
+                                bytes.fromhex("00030013000000010064000000000035")
+                                + b"old\x00"
+                                if old_delivered
+                                else bytes.fromhex("c000000c0000000100640000"),
+                            )
+                            await server._handle_data(old_packet)
+
+                            async def abandon_other() -> None:
+                                other.send(b"lost-other")
+                                await asyncio.sleep(0)
+                                client._t3_cancel()
+                                client._t3_expired()
+
+                            (local if close_from_sender else remote).close()
+                            tx_pos = rx_pos = 0
+                            reset_response = b""
+                            for _ in range(4):
+                                await asyncio.sleep(0)
+                                while tx_pos < tx.await_count:
+                                    packet = tx.await_args_list[tx_pos].args[0]
+                                    tx_pos += 1
+                                    if packet[12] == 130:
+                                        await server._handle_data(packet)
+                                while rx_pos < rx.await_count:
+                                    packet = rx.await_args_list[rx_pos].args[0]
+                                    rx_pos += 1
+                                    if packet[12] != 130:
+                                        continue
+                                    is_response = any(
+                                        kind == 16
+                                        for chunk in parse_packet(packet)[3]
+                                        if isinstance(chunk, ReconfigChunk)
+                                        for kind, body in chunk.params
+                                    )
+                                    if is_response:
+                                        reset_response = packet
+                                        if pending:
+                                            await abandon_other()
+                                    await client._handle_data(packet)
+                            self.assertEqual(local.readyState, "closed")
+                            self.assertEqual(remote.readyState, "closed")
+
+                            replacement = RTCDataChannel(
+                                client,
+                                RTCDataChannelParameters(
+                                    label="new", negotiated=True, id=100
+                                ),
+                            )
+                            remote_replacement = RTCDataChannel(
+                                server,
+                                RTCDataChannelParameters(
+                                    label="new", negotiated=True, id=100
+                                ),
+                            )
+                            remote_replacement.on("message", received.append)
+                            self.assertTrue(reset_response)
+                            await client._handle_data(reset_response)
+                            await client._handle_data(reset_response)
+                            self.assertEqual(replacement.readyState, "open")
+                            if not pending:
+                                await abandon_other()
+                                await asyncio.sleep(0)
+                            forward = tx.await_args.args[0]
+                            with self.subTest(contract="wire"):
+                                self.assertEqual(
+                                    forward[12:],
+                                    bytes.fromhex("c000000c0000000200660000"),
+                                )
+                            for _ in range(2):
+                                client._t3_cancel()
+                                client._t3_expired()
+                                await asyncio.sleep(0)
+                                with self.subTest(contract="retransmitted wire"):
+                                    self.assertEqual(
+                                        tx.await_args.args[0][12:],
+                                        bytes.fromhex("c000000c0000000200660000"),
+                                    )
+                            await server._handle_data(forward)
+                            await server._handle_data(old_packet)
+                            replacement.send(b"first")
+                            replacement.send(b"second")
+                            await asyncio.sleep(0)
+                            first = tx.await_args_list[-2].args[0]
+                            second = tx.await_args_list[-1].args[0]
+                            self.assertEqual(first[20:24], bytes.fromhex("00640000"))
+                            self.assertEqual(second[20:24], bytes.fromhex("00640001"))
+                            await server._handle_data(second)
+                            with self.subTest(contract="hold later message"):
+                                self.assertEqual(received, [])
+                            await server._handle_data(first)
+                            with self.subTest(contract="ordered delivery"):
+                                self.assertEqual(received, [b"first", b"second"])
+                            await client._handle_data(rx.await_args.args[0])
+                            other.send(b"other")
+                            await asyncio.sleep(0)
+                            await server._handle_data(tx.await_args.args[0])
+                            self.assertEqual(received[-1:], [b"other"])
+                            await client._handle_data(rx.await_args.args[0])
+                            self.assertEqual(client._flight_size, 0)
+                            self.assertIsNone(client._t3_handle)
+
+    @asynctest
+    async def test_reset_waits_for_successful_response(self) -> None:
+        for result, offset in ((6, 0), (2, 0), (1, 1)):
+            with self.subTest(result=result, offset=offset):
+                async with client_and_server() as (client, server):
+                    local = RTCDataChannel(
+                        client,
+                        RTCDataChannelParameters(label="old", negotiated=True, id=100),
+                    )
+                    RTCDataChannel(
+                        server,
+                        RTCDataChannelParameters(label="old", negotiated=True, id=100),
+                    )
+                    await server.start(client.getCapabilities(), client.port)
+                    await client.start(server.getCapabilities(), server.port)
+                    await wait_for_outcome(client, server)
+                    with patch.object(
+                        client.transport, "_send_data", new_callable=AsyncMock
+                    ) as tx:
+                        local.close()
+                        await asyncio.sleep(0)
+                        request_chunk = parse_packet(tx.await_args.args[0])[3][0]
+                        assert isinstance(request_chunk, ReconfigChunk)
+                        request = StreamResetOutgoingParam.parse(
+                            request_chunk.params[0][1]
+                        )
+                        response = ReconfigChunk()
+                        response.params = [
+                            (
+                                16,
+                                bytes(
+                                    StreamResetResponseParam(
+                                        response_sequence=tsn_plus_one(
+                                            request.request_sequence
+                                        )
+                                        if offset
+                                        else request.request_sequence,
+                                        result=result,
+                                    )
+                                ),
+                            )
+                        ]
+                        await client._handle_data(
+                            serialize_packet(
+                                5000, 5000, client._local_verification_tag, response
+                            )
+                        )
+                        self.assertEqual(local.readyState, "closing")
+                        with self.assertRaises(ValueError):
+                            RTCDataChannel(
+                                client,
+                                RTCDataChannelParameters(
+                                    label="new", negotiated=True, id=100
+                                ),
+                            )
+
+    @asynctest
+    async def test_reset_defers_until_old_forward_tsn_is_consumed(self) -> None:
+        async with client_and_server() as (client, server):
+            client._local_tsn = 1
+            client._last_sacked_tsn = 0
+            client._advanced_peer_ack_tsn = 0
+            local = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(
+                    label="old", negotiated=True, id=100, maxRetransmits=0
+                ),
+            )
+            remote = RTCDataChannel(
+                server, RTCDataChannelParameters(label="old", negotiated=True, id=100)
+            )
+            other = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(
+                    label="other", negotiated=True, id=102, maxRetransmits=0
+                ),
+            )
+            remote_other = RTCDataChannel(
+                server, RTCDataChannelParameters(label="other", negotiated=True, id=102)
+            )
+            received: list[bytes] = []
+            remote_other.on("message", received.append)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            with (
+                patch.object(
+                    client.transport, "_send_data", new_callable=AsyncMock
+                ) as tx,
+                patch.object(
+                    server.transport, "_send_data", new_callable=AsyncMock
+                ) as rx,
+            ):
+                local.send(b"old")
+                await asyncio.sleep(0)
+                client._t3_cancel()
+                client._t3_expired()
+                await asyncio.sleep(0)
+                first_forward = tx.await_args.args[0]
+                other.send(b"old-other")
+                await asyncio.sleep(0)
+                client._t3_cancel()
+                client._t3_expired()
+                await asyncio.sleep(0)
+                second_forward = tx.await_args.args[0]
+                self.assertEqual(
+                    second_forward[12:],
+                    bytes.fromhex("c0000010000000020064000000660000"),
+                )
+                local.close()
+                await asyncio.sleep(0)
+                reset_request = tx.await_args.args[0]
+                await server._handle_data(reset_request)
+                early_response = rx.await_args.args[0]
+                with self.subTest(contract="reset boundary"):
+                    self.assertEqual(early_response[-4:], bytes.fromhex("00000006"))
+                    self.assertEqual(remote.readyState, "open")
+                await client._handle_data(early_response)
+                await server._handle_data(reset_request)
+                await client._handle_data(rx.await_args.args[0])
+                await server._handle_data(first_forward)
+                with self.subTest(contract="partial progress"):
+                    self.assertEqual(remote.readyState, "open")
+                await server._handle_data(second_forward)
+                tx_pos = rx_pos = 0
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                    while tx_pos < tx.await_count:
+                        packet = tx.await_args_list[tx_pos].args[0]
+                        tx_pos += 1
+                        if packet[12] == 130 and packet != reset_request:
+                            await server._handle_data(packet)
+                    while rx_pos < rx.await_count:
+                        packet = rx.await_args_list[rx_pos].args[0]
+                        rx_pos += 1
+                        if packet[12] == 130:
+                            await client._handle_data(packet)
+                self.assertEqual(local.readyState, "closed")
+                self.assertEqual(remote.readyState, "closed")
+                replacement = RTCDataChannel(
+                    client,
+                    RTCDataChannelParameters(label="new", negotiated=True, id=100),
+                )
+                remote_replacement = RTCDataChannel(
+                    server,
+                    RTCDataChannelParameters(label="new", negotiated=True, id=100),
+                )
+                remote_replacement.on("message", received.append)
+                for delayed in (second_forward, first_forward, second_forward):
+                    await server._handle_data(delayed)
+                replacement.send(b"first")
+                replacement.send(b"second")
+                await asyncio.sleep(0)
+                first = tx.await_args_list[-2].args[0]
+                second = tx.await_args_list[-1].args[0]
+                await server._handle_data(second)
+                self.assertEqual(received, [])
+                await server._handle_data(first)
+                self.assertEqual(received, [b"first", b"second"])
+                await client._handle_data(rx.await_args.args[0])
+                other.send(b"other")
+                await asyncio.sleep(0)
+                await server._handle_data(tx.await_args.args[0])
+                await client._handle_data(rx.await_args.args[0])
+                self.assertEqual(received, [b"first", b"second", b"other"])
+                self.assertEqual(client._flight_size, 0)
+                self.assertIsNone(client._t3_handle)
+
+    @asynctest
     async def test_partial_forward_tsn_ack_does_not_rewind_delivered_stream(
         self,
     ) -> None:
