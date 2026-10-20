@@ -921,15 +921,16 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if not abandon:
             return False
 
-        chunk_pos = self._sent_queue.index(chunk)
+        chunks = [*self._sent_queue, *self._outbound_queue]
+        chunk_pos = chunks.index(chunk)
         for pos in range(chunk_pos, -1, -1):
-            ochunk = self._sent_queue[pos]
+            ochunk = chunks[pos]
             ochunk._abandoned = True
             ochunk._retransmit = False
             if ochunk.flags & SCTP_DATA_FIRST_FRAG:
                 break
-        for pos in range(chunk_pos, len(self._sent_queue)):
-            ochunk = self._sent_queue[pos]
+        for pos in range(chunk_pos, len(chunks)):
+            ochunk = chunks[pos]
             ochunk._abandoned = True
             ochunk._retransmit = False
             if ochunk.flags & SCTP_DATA_LAST_FRAG:
@@ -1645,6 +1646,10 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         if uint32_gt(self._last_sacked_tsn, self._advanced_peer_ack_tsn):
             self._advanced_peer_ack_tsn = self._last_sacked_tsn
+
+        # Retain reserved TSNs until FORWARD TSN can advance past them.
+        while self._outbound_queue and self._outbound_queue[0]._abandoned:
+            self._sent_queue.append(self._outbound_queue.popleft())
 
         done = 0
         streams = {}
