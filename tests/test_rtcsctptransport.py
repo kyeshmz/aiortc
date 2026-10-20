@@ -1413,6 +1413,133 @@ class RTCSctpTransportTest(TestCase):
                         self.assertEqual(type(param).parse(bytes(param)), param)
 
     @asynctest
+    async def test_reliability_open_and_empty_messages(self) -> None:
+        cases = (
+            (
+                RTCDataChannelParameters(
+                    label="chat", protocol="raw", ordered=False, maxRetransmits=3
+                ),
+                bytes.fromhex("03810000000000030004000363686174726177"),
+            ),
+            (
+                RTCDataChannelParameters(
+                    label="chat", protocol="raw", maxPacketLifeTime=60000
+                ),
+                bytes.fromhex("030200000000ea600004000363686174726177"),
+            ),
+        )
+        for parameters, expected_open in cases:
+            with self.subTest(parameters=parameters):
+                async with client_and_server() as (client, server):
+                    incoming = asyncio.get_running_loop().create_future()
+                    server.on("datachannel", incoming.set_result)
+                    await server.start(client.getCapabilities(), client.port)
+                    await client.start(server.getCapabilities(), server.port)
+                    await wait_for_outcome(client, server)
+                    with patch.object(
+                        client.transport,
+                        "_send_data",
+                        wraps=client.transport._send_data,
+                    ) as send:
+                        await client.start(server.getCapabilities(), server.port)
+                        send.assert_not_awaited()
+                        local = RTCDataChannel(client, parameters)
+                        opened = asyncio.Event()
+                        local.on("open", opened.set)
+                        remote = await asyncio.wait_for(incoming, 1)
+                        await asyncio.wait_for(opened.wait(), 1)
+                        open_messages = [
+                            chunk.user_data
+                            for call in send.await_args_list
+                            for chunk in parse_packet(call.args[0])[3]
+                            if isinstance(chunk, DataChunk) and chunk.protocol == 50
+                        ]
+                        self.assertEqual(open_messages, [expected_open])
+                    self.assertEqual(remote.label, "chat")
+                    self.assertEqual(remote.protocol, "raw")
+                    self.assertEqual(remote.ordered, parameters.ordered)
+                    self.assertEqual(remote.maxRetransmits, parameters.maxRetransmits)
+                    self.assertEqual(
+                        remote.maxPacketLifeTime, parameters.maxPacketLifeTime
+                    )
+                    received: asyncio.Queue[str | bytes] = asyncio.Queue()
+                    remote.on("message", received.put_nowait)
+                    for message in ("", b"", "text", b"binary"):
+                        local.send(message)
+                        self.assertEqual(
+                            await asyncio.wait_for(received.get(), 1), message
+                        )
+                    self.assertTrue(received.empty())
+                    self.assertEqual(local.bufferedAmount, 0)
+
+    @asynctest
+    async def test_close_before_connect_preserves_other_channels(self) -> None:
+        for negotiated in (False, True):
+            with self.subTest(negotiated=negotiated):
+                async with client_and_server() as (client, server):
+                    discarded = RTCDataChannel(
+                        client,
+                        RTCDataChannelParameters(
+                            label="discarded",
+                            negotiated=negotiated,
+                            id=2 if negotiated else None,
+                        ),
+                    )
+                    survivor = RTCDataChannel(
+                        client, RTCDataChannelParameters(label="survivor")
+                    )
+                    discarded.close()
+                    discarded.close()
+                    self.assertEqual(discarded.readyState, "closed")
+                    incoming = asyncio.get_running_loop().create_future()
+                    server.on("datachannel", incoming.set_result)
+                    channels = track_channels(server)
+                    opened = asyncio.Event()
+                    survivor.on("open", opened.set)
+                    await server.start(client.getCapabilities(), client.port)
+                    await client.start(server.getCapabilities(), server.port)
+                    remote = await asyncio.wait_for(incoming, 1)
+                    await asyncio.wait_for(opened.wait(), 1)
+                    self.assertEqual(
+                        [channel.label for channel in channels], ["survivor"]
+                    )
+                    received: asyncio.Queue[str] = asyncio.Queue()
+                    remote.on("message", received.put_nowait)
+                    survivor.send("after close")
+                    self.assertEqual(
+                        await asyncio.wait_for(received.get(), 1), "after close"
+                    )
+                    self.assertEqual(discarded.readyState, "closed")
+
+    @asynctest
+    async def test_abort_closes_established_channel(self) -> None:
+        async with client_and_server() as (client, server):
+            local = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=0)
+            )
+            remote = RTCDataChannel(
+                server, RTCDataChannelParameters(label="chat", negotiated=True, id=0)
+            )
+            received: asyncio.Queue[str] = asyncio.Queue()
+            remote.on("message", received.put_nowait)
+            closed = asyncio.Event()
+            local.on("close", closed.set)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            local.send("before abort")
+            self.assertEqual(await asyncio.wait_for(received.get(), 1), "before abort")
+            await server._send_chunk(AbortChunk())
+            await asyncio.wait_for(closed.wait(), 1)
+            self.assertEqual(client.state, "closed")
+            self.assertEqual(local.readyState, "closed")
+            self.assertIsNone(client._t1_handle)
+            self.assertIsNone(client._t2_handle)
+            self.assertIsNone(client._t3_handle)
+            with self.assertRaises(InvalidStateError):
+                local.send("after abort")
+
+    @asynctest
     async def test_unknown_reconfig_parameter_does_not_hide_stream_add(self) -> None:
         async with client_and_server() as (client, server):
             client._outbound_streams_count = 16
@@ -2166,9 +2293,12 @@ class RTCSctpTransportTest(TestCase):
 
     @asynctest
     async def test_construct(self) -> None:
-        async with dummy_dtls_transport_pair() as (client_transport, _):
+        async with dummy_dtls_transport_pair() as (client_transport, server_transport):
             sctpTransport = RTCSctpTransport(client_transport)
             self.assertEqual(sctpTransport.transport, client_transport)
+            self.assertEqual(sctpTransport.port, 5000)
+            sctpTransport.setTransport(server_transport)
+            self.assertIs(sctpTransport.transport, server_transport)
             self.assertEqual(sctpTransport.port, 5000)
 
     @asynctest
