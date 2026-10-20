@@ -523,9 +523,9 @@ class RtcpSdesPacket:
             payload += pack("!L", chunk.ssrc)
             for d_type, d_value in chunk.items:
                 payload += pack("!BB", d_type, len(d_value)) + d_value
-            payload += b"\x00\x00"
-        while len(payload) % 4:
             payload += b"\x00"
+            while len(payload) % 4:
+                payload += b"\x00"
         return pack_rtcp_packet(RTCP_SDES, len(self.chunks), payload)
 
     @classmethod
