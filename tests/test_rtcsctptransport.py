@@ -17,6 +17,7 @@ from aiortc.rtcsctptransport import (
     USERDATA_MAX_LENGTH,
     AbortChunk,
     Chunk,
+    CookieAckChunk,
     CookieEchoChunk,
     DataChunk,
     ErrorChunk,
@@ -24,6 +25,7 @@ from aiortc.rtcsctptransport import (
     HeartbeatAckChunk,
     HeartbeatChunk,
     InboundStream,
+    InitAckChunk,
     InitChunk,
     ReconfigChunk,
     RTCSctpCapabilities,
@@ -671,6 +673,82 @@ class SctpUtilTest(TestCase):
 
 class RTCSctpTransportTest(TestCase):
     @asynctest
+    async def test_init_ack_without_cookie_aborts_association(self) -> None:
+        for params in ([], [(0x8008, b"\x82")]):
+            with self.subTest(params=params):
+                async with client_standalone() as client:
+                    channel = RTCDataChannel(
+                        client,
+                        RTCDataChannelParameters(label="chat", negotiated=True, id=100),
+                    )
+                    with patch.object(
+                        client.transport, "_send_data", new_callable=AsyncMock
+                    ) as send:
+                        await client.start(client.getCapabilities(), 5000)
+                        chunk = InitAckChunk()
+                        chunk.initiate_tag = 0x01020304
+                        chunk.advertised_rwnd = 131072
+                        chunk.outbound_streams = 16
+                        chunk.inbound_streams = 16
+                        chunk.initial_tsn = 100
+                        chunk.params = params
+                        await client._handle_data(
+                            serialize_packet(
+                                5000, 5000, client._local_verification_tag, chunk
+                            )
+                        )
+                        self.assertEqual(send.await_count, 2)
+                        self.assertEqual(
+                            send.await_args.args[0][:8],
+                            bytes.fromhex("1388138801020304"),
+                        )
+                        self.assertEqual(
+                            send.await_args.args[0][12:],
+                            bytes.fromhex("0600000e0002000a0000000100070000"),
+                        )
+                        self.assertEqual(client.state, "closed")
+                        self.assertEqual(channel.readyState, "closed")
+                        self.assertIsNone(client._t1_handle)
+
+    @asynctest
+    async def test_init_ack_echoes_cookie_between_optional_parameters(self) -> None:
+        async with client_standalone() as client:
+            channel = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            with patch.object(
+                client.transport, "_send_data", new_callable=AsyncMock
+            ) as send:
+                await client.start(client.getCapabilities(), 5000)
+                chunk = InitAckChunk()
+                chunk.initiate_tag = 0x01020304
+                chunk.advertised_rwnd = 131072
+                chunk.outbound_streams = 16
+                chunk.inbound_streams = 16
+                chunk.initial_tsn = 100
+                chunk.params = [(0x8008, b"\x82"), (7, b"cookie"), (0xC000, b"")]
+                await client._handle_data(
+                    serialize_packet(5000, 5000, client._local_verification_tag, chunk)
+                )
+                self.assertEqual(send.await_count, 2)
+                self.assertEqual(
+                    send.await_args.args[0][:8], bytes.fromhex("1388138801020304")
+                )
+                self.assertEqual(
+                    send.await_args.args[0][12:], b"\x0a\x00\x00\x0acookie\x00\x00"
+                )
+                self.assertEqual(channel.readyState, "connecting")
+                self.assertIsNotNone(client._t1_handle)
+                await client._handle_data(
+                    serialize_packet(
+                        5000, 5000, client._local_verification_tag, CookieAckChunk()
+                    )
+                )
+                self.assertEqual(client.state, "connected")
+                self.assertEqual(channel.readyState, "open")
+                self.assertIsNone(client._t1_handle)
+
+    @asynctest
     async def test_unknown_reconfig_parameter_does_not_hide_stream_add(self) -> None:
         async with client_and_server() as (client, server):
             client._outbound_streams_count = 16
@@ -761,6 +839,8 @@ class RTCSctpTransportTest(TestCase):
     async def test_abandon_fragment_after_first_fragment_acknowledged(self) -> None:
         async with client_and_server() as (client, server):
             client._local_tsn = 1
+            client._last_sacked_tsn = 0
+            client._advanced_peer_ack_tsn = 0
             server._advertised_rwnd = 131072
             local = RTCDataChannel(
                 client,
@@ -830,6 +910,8 @@ class RTCSctpTransportTest(TestCase):
     async def test_fast_abandon_sends_forward_tsn_without_restarting_t3(self) -> None:
         async with client_and_server() as (client, server):
             client._local_tsn = 1
+            client._last_sacked_tsn = 0
+            client._advanced_peer_ack_tsn = 0
             server._advertised_rwnd = 131072
             lost = RTCDataChannel(
                 client,

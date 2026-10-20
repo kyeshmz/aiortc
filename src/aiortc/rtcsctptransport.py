@@ -53,6 +53,7 @@ REMOTE_DEFAULT_MAX_MESSAGE_SIZE = 65536
 
 # protocol constants
 SCTP_CAUSE_INVALID_STREAM = 0x0001
+SCTP_CAUSE_MISSING_PARAM = 0x0002
 SCTP_CAUSE_STALE_COOKIE = 0x0003
 
 SCTP_DATA_LAST_FRAG = 0x01
@@ -1071,6 +1072,20 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             isinstance(chunk, InitAckChunk)
             and self._association_state == self.State.COOKIE_WAIT
         ):
+            for k, v in chunk.params:
+                if k == SCTP_STATE_COOKIE:
+                    echo = CookieEchoChunk(body=v)
+                    break
+            else:
+                self._remote_verification_tag = chunk.initiate_tag
+                abort = AbortChunk()
+                abort.params.append(
+                    (SCTP_CAUSE_MISSING_PARAM, pack("!LH", 1, SCTP_STATE_COOKIE))
+                )
+                await self._send_chunk(abort)
+                self._set_state(self.State.CLOSED)
+                return
+
             # cancel T1 timer and process chunk
             self._t1_cancel()
             self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
@@ -1091,11 +1106,6 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 self._outbound_streams_count, chunk.inbound_streams
             )
 
-            echo = CookieEchoChunk()
-            for k, v in chunk.params:
-                if k == SCTP_STATE_COOKIE:
-                    echo.body = v
-                    break
             await self._send_chunk(echo)
 
             # start T1 timer and enter COOKIE-ECHOED state
