@@ -678,6 +678,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         # inbound
         self._advertised_rwnd = 1024 * 1024
         self._inbound_streams: dict[int, InboundStream] = {}
+        self._inbound_stream_last_delivered_tsn: dict[int, int] = {}
         self._inbound_streams_count = 0
         self._inbound_streams_max = MAX_STREAMS
         self._last_received_tsn: Optional[int] = None
@@ -706,6 +707,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._reconfig_request: Optional[StreamResetOutgoingParam] = None
         self._reconfig_request_seq = self._local_tsn
         self._reconfig_response_seq = 0
+        self._reconfig_reset_pending: Optional[StreamResetOutgoingParam] = None
 
         # rtt calculation
         self._srtt: Optional[float] = None
@@ -911,6 +913,13 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         for chunk in chunks:
             await self._receive_chunk(chunk)
 
+        if self._reconfig_reset_pending is not None and uint32_gte(
+            self._last_received_tsn, self._reconfig_reset_pending.last_tsn
+        ):
+            param = self._reconfig_reset_pending
+            self._reconfig_reset_pending = None
+            await self._receive_reconfig_param(param)
+
         # send SACK if needed
         if self._sack_needed:
             await self._send_sack()
@@ -978,6 +987,22 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         Receive data stream -> ULP.
         """
         await self._data_channel_receive(stream_id, pp_id, data)
+
+    def _pop_inbound_messages(self, stream_id: int) -> list[tuple[int, int, bytes]]:
+        stream = self._inbound_streams[stream_id]
+        chunks = list(stream.reassembly)
+        messages = list(stream.pop_messages())
+        if messages:
+            remaining = {chunk.tsn for chunk in stream.reassembly}
+            last_tsn = self._inbound_stream_last_delivered_tsn.get(stream_id)
+            for chunk in chunks:
+                if chunk.tsn not in remaining and not (
+                    chunk.flags & SCTP_DATA_UNORDERED
+                ):
+                    if last_tsn is None or uint32_gt(chunk.tsn, last_tsn):
+                        last_tsn = chunk.tsn
+                        self._inbound_stream_last_delivered_tsn[stream_id] = last_tsn
+        return messages
 
     async def _receive_chunk(self, chunk: Chunk) -> None:
         """
@@ -1163,7 +1188,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         # defragment data
         inbound_stream.add_chunk(chunk)
         self._advertised_rwnd -= len(chunk.user_data)
-        for message in inbound_stream.pop_messages():
+        for message in self._pop_inbound_messages(chunk.stream_id):
             self._advertised_rwnd += len(message[2])
             await self._receive(*message)
 
@@ -1195,13 +1220,17 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         # update reassembly
         for stream_id, stream_seq in chunk.streams:
+            # Retained skips can outlive half of the 16-bit SSN space.
+            last_delivered_tsn = self._inbound_stream_last_delivered_tsn.get(stream_id)
+            if last_delivered_tsn is not None and uint32_gte(
+                last_delivered_tsn, chunk.cumulative_tsn
+            ):
+                continue
             inbound_stream = self._get_inbound_stream(stream_id)
 
             # advance sequence number and perform delivery
-            next_seq = uint16_add(stream_seq, 1)
-            if uint16_gt(next_seq, inbound_stream.sequence_number):
-                inbound_stream.sequence_number = next_seq
-            for message in inbound_stream.pop_messages():
+            inbound_stream.sequence_number = uint16_add(stream_seq, 1)
+            for message in self._pop_inbound_messages(stream_id):
                 self._advertised_rwnd += len(message[2])
                 await self._receive(*message)
 
@@ -1319,9 +1348,19 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self.__log_debug("<< %s", param)
 
         if isinstance(param, StreamResetOutgoingParam):
+            if uint32_gt(param.last_tsn, self._last_received_tsn):
+                self._reconfig_reset_pending = param
+                await self._send_reconfig_param(
+                    StreamResetResponseParam(
+                        response_sequence=param.request_sequence, result=6
+                    )
+                )
+                return
+
             # mark closed inbound streams
             for stream_id in param.streams:
                 self._inbound_streams.pop(stream_id, None)
+                self._inbound_stream_last_delivered_tsn.pop(stream_id, None)
 
                 # close data channel
                 channel = self._data_channels.get(stream_id)
@@ -1350,13 +1389,27 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             if (
                 self._reconfig_request
                 and param.response_sequence == self._reconfig_request.request_sequence
+                and param.result in (0, 1)
             ):
-                # mark closed streams
-                for stream_id in self._reconfig_request.streams:
+                request = self._reconfig_request
+                self._reconfig_request = None
+                for stream_id in request.streams:
                     self._outbound_stream_seq.pop(stream_id, None)
+                    self._forward_tsn_streams.pop(stream_id, None)
+                if self._forward_tsn_chunk is not None:
+                    self._forward_tsn_chunk.streams = list(
+                        self._forward_tsn_streams.items()
+                    )
+
+                # RFC 6525 requires the peer to consume last_tsn before success.
+                # Retire that data too, so a lost SACK cannot revive old skips.
+                sack = SackChunk()
+                sack.cumulative_tsn = request.last_tsn
+                await self._receive_sack_chunk(sack)
+
+                for stream_id in request.streams:
                     self._data_channel_closed(stream_id)
 
-                self._reconfig_request = None
                 await self._transmit_reconfig()
 
     async def _send(
@@ -1672,6 +1725,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._sent_queue.append(self._outbound_queue.popleft())
 
         while self._sent_queue and self._sent_queue[0]._abandoned:
+            # Old skips must not cross a reset boundary before its response.
+            if self._reconfig_request is not None and uint32_gt(
+                self._sent_queue[0].tsn, self._reconfig_request.last_tsn
+            ):
+                break
             chunk = self._sent_queue.popleft()
             self._advanced_peer_ack_tsn = chunk.tsn
             if not (chunk.flags & SCTP_DATA_UNORDERED):
