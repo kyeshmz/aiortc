@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from aiortc import MediaStreamTrack
 from aiortc.codecs import PCMU_CODEC
+from aiortc.codecs.vpx import Vp8Encoder
 from aiortc.exceptions import InvalidStateError
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiortc.rtcrtpparameters import (
@@ -24,6 +25,7 @@ from aiortc.rtp import (
     RtcpReceiverInfo,
     RtcpRrPacket,
     RtcpRtpfbPacket,
+    RtcpSdesPacket,
     RtpPacket,
     is_rtcp,
     pack_remb_fci,
@@ -51,6 +53,39 @@ class BuggyStreamTrack(MediaStreamTrack):
 
 
 class RTCRtpSenderTest(TestCase):
+    @asynctest
+    async def test_feedback_only_changes_its_target_sender(self) -> None:
+        encoder = Vp8Encoder()
+        track = VideoStreamTrack()
+        try:
+            async with dummy_dtls_transport_pair() as (local_transport, _):
+                sender = RTCRtpSender(track, local_transport)
+                sender._ssrc = 1234
+                with patch("aiortc.rtcrtpsender.get_encoder", return_value=encoder):
+                    self.assertIsNotNone(await sender._next_encoded_frame(VP8_CODEC))
+                self.assertEqual(encoder.target_bitrate, 500000)
+                await sender._handle_rtcp_packet(
+                    RtcpPsfbPacket(
+                        fmt=RTCP_PSFB_APP,
+                        ssrc=1,
+                        media_ssrc=0,
+                        fci=pack_remb_fci(1000000, [1234]),
+                    )
+                )
+                self.assertEqual(encoder.target_bitrate, 1000000)
+                await sender._handle_rtcp_packet(
+                    RtcpPsfbPacket(
+                        fmt=RTCP_PSFB_APP,
+                        ssrc=1,
+                        media_ssrc=0,
+                        fci=pack_remb_fci(500000, [5678]),
+                    )
+                )
+                await sender._handle_rtcp_packet(RtcpSdesPacket())
+                self.assertEqual(encoder.target_bitrate, 1000000)
+        finally:
+            track.stop()
+
     def test_capabilities(self) -> None:
         # audio
         capabilities = RTCRtpSender.getCapabilities("audio")

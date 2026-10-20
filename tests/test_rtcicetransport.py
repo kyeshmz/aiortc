@@ -28,6 +28,23 @@ async def mock_get_event() -> Optional[aioice.ice.ConnectionEvent]:
 
 
 class ConnectionKwargsTest(TestCase):
+    def test_unsupported_secure_stun_does_not_hide_turn(self) -> None:
+        self.assertEqual(
+            connection_kwargs(
+                [
+                    RTCIceServer("stuns:stun.example.com"),
+                    RTCIceServer("turn:turn.example.com"),
+                ]
+            ),
+            {
+                "turn_password": None,
+                "turn_server": ("turn.example.com", 3478),
+                "turn_ssl": False,
+                "turn_transport": "udp",
+                "turn_username": None,
+            },
+        )
+
     def test_empty(self) -> None:
         self.assertEqual(connection_kwargs([]), {})
 

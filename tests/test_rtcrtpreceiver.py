@@ -1,9 +1,10 @@
 import asyncio
 import contextlib
+import datetime
 import fractions
 from collections.abc import AsyncGenerator
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import av
 from aiortc.codecs import PCMU_CODEC, get_encoder
@@ -87,6 +88,14 @@ def create_rtp_video_packets(
 
 
 class NackGeneratorTest(TestCase):
+    def test_truncate_before_first_packet(self) -> None:
+        generator = NackGenerator()
+        generator.truncate()
+        self.assertEqual(generator.missing, set())
+        generator.add(RtpPacket(sequence_number=0))
+        self.assertTrue(generator.add(RtpPacket(sequence_number=2)))
+        self.assertEqual(generator.missing, {1})
+
     def test_no_loss(self) -> None:
         generator = NackGenerator()
 
@@ -377,6 +386,11 @@ class RTCRtpReceiverTest(CodecTestCase):
             self.assertEqual(len(sources), 1)
             self.assertIsInstance(sources[0], RTCRtpSynchronizationSource)
             self.assertEqual(sources[0].source, 4028317929)
+            with patch("aiortc.rtcrtpreceiver.clock.current_datetime") as now:
+                now.return_value = sources[0].timestamp + datetime.timedelta(seconds=10)
+                self.assertEqual(receiver.getSynchronizationSources(), sources)
+                now.return_value = sources[0].timestamp + datetime.timedelta(seconds=11)
+                self.assertEqual(receiver.getSynchronizationSources(), [])
 
             # check remote track
             frame = self.ensureIsInstance(await receiver.track.recv(), av.AudioFrame)
@@ -549,24 +563,30 @@ class RTCRtpReceiverTest(CodecTestCase):
     @asynctest
     async def test_send_rtcp_nack(self) -> None:
         async with create_receiver("video") as receiver:
-            receiver._set_rtcp_ssrc(1234)
-            receiver._track = RemoteStreamTrack(kind="video")
-
-            await receiver.receive(RTCRtpReceiveParameters(codecs=[VP8_CODEC]))
-
-            # send RTCP feedback NACK
-            await receiver._send_rtcp_nack(5678, [7654])
+            with patch.object(
+                receiver.transport, "_send_rtp", new_callable=AsyncMock
+            ) as send:
+                await receiver._send_rtcp_nack(5678, [7654])
+                send.assert_not_awaited()
+                receiver._set_rtcp_ssrc(1234)
+                await receiver._send_rtcp_nack(5678, [7654])
+                send.assert_awaited_once_with(
+                    b"\x81\xcd\x00\x03\x00\x00\x04\xd2\x00\x00\x16\x2e\x1d\xe6\x00\x00"
+                )
 
     @asynctest
     async def test_send_rtcp_pli(self) -> None:
         async with create_receiver("video") as receiver:
-            receiver._set_rtcp_ssrc(1234)
-            receiver._track = RemoteStreamTrack(kind="video")
-
-            await receiver.receive(RTCRtpReceiveParameters(codecs=[VP8_CODEC]))
-
-            # send RTCP feedback PLI
-            await receiver._send_rtcp_pli(5678)
+            with patch.object(
+                receiver.transport, "_send_rtp", new_callable=AsyncMock
+            ) as send:
+                await receiver._send_rtcp_pli(5678)
+                send.assert_not_awaited()
+                receiver._set_rtcp_ssrc(1234)
+                await receiver._send_rtcp_pli(5678)
+                send.assert_awaited_once_with(
+                    b"\x81\xce\x00\x02\x00\x00\x04\xd2\x00\x00\x16\x2e"
+                )
 
     def test_invalid_dtls_transport_state(self) -> None:
         dtlsTransport = ClosedDtlsTransport()
