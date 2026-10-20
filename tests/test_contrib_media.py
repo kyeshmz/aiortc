@@ -1,13 +1,15 @@
 import asyncio
 import errno
+import fractions
 import os
 import tempfile
+import threading
 import time
 import wave
 from collections.abc import Iterator
 from typing import Any, cast
 from unittest import TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import av
 import av.container
@@ -469,6 +471,167 @@ class BufferingInputContainer:
         return getattr(self.__real, name)
 
 
+class CaptureInputContainer:
+    """Model a non-seekable V4L2 device with real encoded capture media."""
+
+    def __init__(self, real: av.container.InputContainer) -> None:
+        self.__real = real
+        self.format = av.format.ContainerFormat("v4l2")
+        self.name = "/dev/video-test"
+        self.duration = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__real, name)
+
+
+class MediaPlayerInputTest(MediaTestCase):
+    def create_capture_file(self, name: str, sizes: list[tuple[int, int]]) -> str:
+        path = self.temporary_path(name)
+        with av.open(path, "w") as container:
+            streams = []
+            for width, height in sizes:
+                stream = container.add_stream("h264", rate=30, options={"bf": "0"})
+                assert isinstance(stream, av.VideoStream)
+                stream.width = width
+                stream.height = height
+                streams.append(stream)
+            for stream, (width, height) in zip(streams, sizes):
+                for pts in (900000, 1080000, 1260000):
+                    frame = self.create_video_frame(width=width, height=height, pts=pts)
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode(None):
+                    container.mux(packet)
+        return path
+
+    async def receive_video(self, track: MediaStreamTrack) -> list[int]:
+        timestamps = []
+        for _ in range(3):
+            media = await track.recv()
+            if isinstance(media, av.VideoFrame):
+                self.assertEqual((media.width, media.height), (64, 48))
+                self.assertEqual(bytes(media.planes[0])[:64], bytes(64))
+            else:
+                assert isinstance(media, av.Packet)
+                assert isinstance(media.stream, av.VideoStream)
+                self.assertGreater(media.size, 0)
+                self.assertEqual((media.stream.width, media.stream.height), (64, 48))
+                self.assertEqual(media.stream.index, 0)
+            self.assertEqual(media.time_base, fractions.Fraction(1, 90000))
+            timestamps.append(media.pts)
+        with self.assertRaises(MediaStreamError):
+            await track.recv()
+        self.assertEqual(track.readyState, "ended")
+        with self.assertRaises(MediaStreamError):
+            await track.recv()
+        return timestamps
+
+    @asynctest
+    async def test_compressed_audio_only_eof(self) -> None:
+        path = self.temporary_path("test.ogg")
+        with av.open(path, "w") as output:
+            stream = output.add_stream("libopus", rate=48000)
+            assert isinstance(stream, av.AudioStream)
+            for frame in self.create_audio_frames("mono", 48000, 5):
+                for packet in stream.encode(frame):
+                    output.mux(packet)
+            for packet in stream.encode(None):
+                output.mux(packet)
+
+        threads = set(threading.enumerate())
+        with av.open(path, "r") as container:
+            with patch("av.open", return_value=container):
+                player = MediaPlayer(path, decode=False)
+            self.assertIsNone(player.video)
+            assert player.audio is not None
+            try:
+                timestamps = []
+                samples = 0
+                with self.assertNoLogs("aiortc.contrib.media", level="WARNING"):
+                    for _ in range(6):
+                        media = await asyncio.wait_for(player.audio.recv(), timeout=1)
+                        assert isinstance(media, av.Packet)
+                        self.assertGreater(media.size, 0)
+                        self.assertEqual(media.stream.codec_context.name, "opus")
+                        self.assertEqual(media.time_base, fractions.Fraction(1, 48000))
+                        timestamps.append(media.pts)
+                        for decoded_frame in media.decode():
+                            assert isinstance(decoded_frame, av.AudioFrame)
+                            self.assertEqual(decoded_frame.sample_rate, 48000)
+                            samples += decoded_frame.samples
+                    with self.assertRaises(MediaStreamError):
+                        await asyncio.wait_for(player.audio.recv(), timeout=1)
+                self.assertEqual(timestamps, [-312, 648, 1608, 2568, 3528, 4488])
+                self.assertEqual(samples, 4800)
+                self.assertEqual(player.audio.readyState, "ended")
+                with self.assertRaises(MediaStreamError):
+                    await player.audio.recv()
+                with self.assertRaisesRegex(AssertionError, "^Container is not open$"):
+                    next(container.demux())
+            finally:
+                player.audio.stop()
+        self.assertEqual(set(threading.enumerate()) - threads, set())
+
+    @asynctest
+    async def test_first_video_stream_only(self) -> None:
+        path = self.create_capture_file("multiple.ts", [(64, 48), (128, 96)])
+        for decode in (True, False):
+            with self.subTest(decode=decode):
+                threads = set(threading.enumerate())
+                with av.open(path, "r") as container:
+                    self.assertEqual(len(container.streams.video), 2)
+                    with patch("av.open", return_value=container):
+                        player = MediaPlayer(path, decode=decode)
+                    self.assertIsNone(player.audio)
+                    assert player.video is not None
+                    try:
+                        with self.assertNoLogs("aiortc.contrib.media", level="WARNING"):
+                            timestamps = await asyncio.wait_for(
+                                self.receive_video(player.video), timeout=6
+                            )
+                        self.assertEqual(timestamps, [0, 180000, 360000])
+                        with self.assertRaisesRegex(
+                            AssertionError, "^Container is not open$"
+                        ):
+                            next(container.demux())
+                    finally:
+                        player.video.stop()
+                self.assertEqual(set(threading.enumerate()) - threads, set())
+
+    @asynctest
+    async def test_capture_device_does_not_pace_again(self) -> None:
+        path = self.create_capture_file("capture.ts", [(64, 48)])
+        for decode in (True, False):
+            with self.subTest(decode=decode):
+                threads = set(threading.enumerate())
+                with av.open(path, "r") as container:
+                    capture = CaptureInputContainer(container)
+                    with patch("av.open", return_value=capture) as open_device:
+                        player = MediaPlayer(capture.name, format="v4l2", decode=decode)
+                    open_device.assert_called_once_with(
+                        file="/dev/video-test",
+                        format="v4l2",
+                        mode="r",
+                        options=None,
+                        timeout=None,
+                    )
+                    self.assertIsNone(player.audio)
+                    assert player.video is not None
+                    try:
+                        with self.assertNoLogs("aiortc.contrib.media", level="WARNING"):
+                            timestamps = await asyncio.wait_for(
+                                self.receive_video(player.video), timeout=1
+                            )
+                        self.assertEqual(timestamps, [0, 180000, 360000])
+                        with self.assertRaisesRegex(
+                            AssertionError, "^Container is not open$"
+                        ):
+                            next(container.demux())
+                    finally:
+                        player.video.stop()
+                self.assertEqual(set(threading.enumerate()) - threads, set())
+
+
 class MediaPlayerTest(MediaTestCase):
     def assertAudio(self, frame: Any) -> None:
         assert isinstance(frame, av.AudioFrame)
@@ -721,6 +884,35 @@ class MediaPlayerNoDecodeTest(MediaPlayerTest):
 
 
 class MediaRecorderTest(MediaTestCase):
+    @asynctest
+    async def test_stop_before_start(self) -> None:
+        path = self.temporary_path("unstarted.wav")
+        track = AudioStreamTrack()
+        recv = AsyncMock(side_effect=AssertionError("Unstarted track was consumed"))
+        with av.open(path, "w") as container:
+            output = Mock(wraps=container, format=container.format)
+            with (
+                patch("av.open", return_value=output),
+                patch.object(track, "recv", recv),
+            ):
+                recorder = MediaRecorder(path)
+                recorder.addTrack(track)
+                codec = container.streams[0].codec_context
+                self.assertFalse(codec.is_open)
+                try:
+                    await recorder.stop()
+                    await recorder.stop()
+                    await recorder.start()
+                    await asyncio.sleep(0)
+                    recv.assert_not_awaited()
+                    output.close.assert_called_once_with()
+                    self.assertFalse(codec.is_open)
+                    self.assertFalse(os.path.exists(path))
+                    self.assertEqual(track.readyState, "live")
+                finally:
+                    await recorder.stop()
+                    track.stop()
+
     def assertAudioStream(self, stream: av.stream.Stream, codec_name: str) -> None:
         assert isinstance(stream, av.AudioStream)
         self.assertEqual(stream.codec.name, codec_name)
