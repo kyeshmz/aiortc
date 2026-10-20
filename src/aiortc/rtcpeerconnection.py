@@ -860,7 +860,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 if media.kind in ["audio", "video"]:
                     transceiver = self.__getTransceiverByMLineIndex(i)
                     transceiver.receiver.transport._set_role(media.dtls.role)
-                    transceiver._setCurrentDirection(media.direction)
+                    transceiver._setCurrentDirection(media.direction or "sendrecv")
                 else:
                     self.__sctp.transport._set_role(media.dtls.role)
 
@@ -954,7 +954,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 )
 
                 # configure direction
-                direction = reverse_direction(media.direction)
+                direction = reverse_direction(media.direction or "sendrecv")
                 if description.type in ["answer", "pranswer"]:
                     transceiver._setCurrentDirection(direction)
                 else:
