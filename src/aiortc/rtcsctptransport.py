@@ -1182,7 +1182,9 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             inbound_stream = self._get_inbound_stream(stream_id)
 
             # advance sequence number and perform delivery
-            inbound_stream.sequence_number = uint16_add(stream_seq, 1)
+            next_seq = uint16_add(stream_seq, 1)
+            if uint16_gt(next_seq, inbound_stream.sequence_number):
+                inbound_stream.sequence_number = next_seq
             for message in inbound_stream.pop_messages():
                 self._advertised_rwnd += len(message[2])
                 await self._receive(*message)
@@ -1280,8 +1282,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         self._update_advanced_peer_ack_point()
 
-        if not self._sent_queue and not self._forward_tsn_chunk:
-            # There is no outstanding DATA or FORWARD TSN, stop T3.
+        if not self._sent_queue and self._forward_tsn_chunk is None:
             self._t3_cancel()
         elif done:
             # the earliest outstanding chunk was acknowledged, restart T3

@@ -784,8 +784,17 @@ class RTCSctpTransportTest(TestCase):
                 server,
                 RTCDataChannelParameters(label="partial", negotiated=True, id=100),
             )
+            reliable = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(label="reliable", negotiated=True, id=102),
+            )
+            remote_reliable = RTCDataChannel(
+                server,
+                RTCDataChannelParameters(label="reliable", negotiated=True, id=102),
+            )
             received: asyncio.Queue[bytes] = asyncio.Queue()
             remote.on("message", received.put_nowait)
+            remote_reliable.on("message", received.put_nowait)
             await server.start(client.getCapabilities(), client.port)
             await client.start(server.getCapabilities(), server.port)
             await wait_for_outcome(client, server)
@@ -800,7 +809,7 @@ class RTCSctpTransportTest(TestCase):
                 local.send(b"M" * 4640)
                 await asyncio.sleep(0)
                 self.assertEqual(tx.await_count, 3)
-                for expiry in range(3):
+                for expiry in range(2):
                     client._t3_cancel()
                     client._t3_expired()
                     await asyncio.sleep(0)
@@ -811,15 +820,40 @@ class RTCSctpTransportTest(TestCase):
                     )
                     self.assertIsNotNone(client._t3_handle)
                     self.assertEqual(client._flight_size, 0)
-                await server._handle_data(tx.await_args.args[0])
-                await client._handle_data(rx.await_args.args[0])
-                self.assertIsNone(client._t3_handle)
+                reliable.send(b"other")
+                await asyncio.sleep(0)
                 self.assertEqual(tx.await_count, 6)
+                reliable_data = tx.await_args.args[0]
+                self.assertEqual(
+                    reliable_data[12:],
+                    bytes.fromhex("00030015000000050066000000000035")
+                    + b"other\x00\x00\x00",
+                )
+                client._t3_cancel()
+                client._t3_expired()
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    [call.args[0][12:] for call in tx.await_args_list[6:]],
+                    [bytes.fromhex("c000000c0000000400640000"), reliable_data[12:]],
+                )
+                self.assertEqual(client._flight_size, 5)
+                self.assertEqual(client._rto, 3.0)
+                timer = client._t3_handle
+                self.assertIsNotNone(timer)
+                await server._handle_data(tx.await_args_list[6].args[0])
+                await client._handle_data(rx.await_args.args[0])
+                self.assertEqual(client._flight_size, 5)
+                self.assertIs(client._t3_handle, timer)
+                await server._handle_data(tx.await_args_list[7].args[0])
+                await client._handle_data(rx.await_args.args[0])
+                self.assertEqual(await asyncio.wait_for(received.get(), 1), b"other")
+                self.assertIsNone(client._t3_handle)
+                self.assertEqual(tx.await_count, 8)
                 local.send(b"after")
                 await asyncio.sleep(0)
                 self.assertEqual(
                     tx.await_args.args[0][12:],
-                    bytes.fromhex("00030015000000050064000100000035")
+                    bytes.fromhex("00030015000000060064000100000035")
                     + b"after\x00\x00\x00",
                 )
                 await server._handle_data(tx.await_args.args[0])
@@ -964,7 +998,10 @@ class RTCSctpTransportTest(TestCase):
                                 await server._handle_data(call.args[0])
                                 await client._handle_data(rx.await_args.args[0])
                             self.assertEqual(
-                                [await received.get(), await received.get()],
+                                [
+                                    await asyncio.wait_for(received.get(), 1),
+                                    await asyncio.wait_for(received.get(), 1),
+                                ],
                                 [b"after", b"other"],
                             )
                             self.assertTrue(received.empty())
