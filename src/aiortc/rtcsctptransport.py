@@ -922,19 +922,18 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             return False
 
         chunks = [*self._sent_queue, *self._outbound_queue]
-        chunk_pos = chunks.index(chunk)
-        for pos in range(chunk_pos, -1, -1):
-            ochunk = chunks[pos]
+        first_pos = last_pos = chunks.index(chunk)
+        while first_pos > 0 and not (chunks[first_pos].flags & SCTP_DATA_FIRST_FRAG):
+            first_pos -= 1
+        while last_pos < len(chunks) - 1 and not (
+            chunks[last_pos].flags & SCTP_DATA_LAST_FRAG
+        ):
+            last_pos += 1
+        for ochunk in chunks[first_pos : last_pos + 1]:
+            if ochunk._sent_count and not ochunk._acked and not ochunk._retransmit:
+                self._flight_size_decrease(ochunk)
             ochunk._abandoned = True
             ochunk._retransmit = False
-            if ochunk.flags & SCTP_DATA_FIRST_FRAG:
-                break
-        for pos in range(chunk_pos, len(chunks)):
-            ochunk = chunks[pos]
-            ochunk._abandoned = True
-            ochunk._retransmit = False
-            if ochunk.flags & SCTP_DATA_LAST_FRAG:
-                break
 
         return True
 
@@ -1209,7 +1208,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ):
             schunk = self._sent_queue.popleft()
             done += 1
-            if not schunk._acked:
+            if not schunk._acked and not schunk._abandoned:
                 done_bytes += schunk._book_size
                 self._flight_size_decrease(schunk)
 
@@ -1232,24 +1231,25 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 if uint32_gt(schunk.tsn, highest_seen_tsn):
                     break
                 if schunk.tsn in seen and not schunk._acked:
-                    done_bytes += schunk._book_size
                     schunk._acked = True
-                    self._flight_size_decrease(schunk)
+                    if not schunk._abandoned:
+                        done_bytes += schunk._book_size
+                        self._flight_size_decrease(schunk)
                     highest_newly_acked = schunk.tsn
 
             # strike missing chunks prior to HTNA
             for schunk in self._sent_queue:
                 if uint32_gt(schunk.tsn, highest_newly_acked):
                     break
-                if schunk.tsn not in seen:
+                if schunk.tsn not in seen and not schunk._abandoned:
                     schunk._misses += 1
                     if schunk._misses == 3:
                         schunk._misses = 0
                         if not self._maybe_abandon(schunk):
                             schunk._retransmit = True
+                            self._flight_size_decrease(schunk)
 
                         schunk._acked = False
-                        self._flight_size_decrease(schunk)
 
                         loss = True
 
