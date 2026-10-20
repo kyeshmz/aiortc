@@ -332,6 +332,29 @@ class H265PayloadTest(TestCase):
 
 
 class H265Test(CodecTestCase):
+    def test_encoder_buffering(self) -> None:
+        encoder = H265Encoder()
+        codec = self.ensureIsInstance(
+            av.CodecContext.create("libx265", "w"), av.VideoCodecContext
+        )
+        codec.width = 320
+        codec.height = 240
+        codec.bit_rate = 1000000
+        codec.pix_fmt = "yuv420p"
+        codec.time_base = fractions.Fraction(1, 30)
+        codec.framerate = fractions.Fraction(30)
+        codec.thread_count = 1
+        codec.options = {
+            "preset": "ultrafast",
+            "x265-params": (
+                "pools=none:frame-threads=1:wpp=0:log-level=error:"
+                "bframes=0:rc-lookahead=1"
+            ),
+        }
+        encoder.codec = codec
+        self.assertEqual(encoder.encode(self.create_video_frame(320, 240, 0)), ([], 0))
+        self.assertEqual(len(codec.encode(None)), 1)
+
     def test_decoder_junk(self) -> None:
         for data in (
             b"123",
@@ -420,6 +443,7 @@ class H265Test(CodecTestCase):
                 (640, 480, True),
                 (640, 480, False),
                 (320, 240, False),
+                (320, 256, False),
             )
         ):
             if i == 3:
@@ -492,6 +516,10 @@ class H265Test(CodecTestCase):
         self.assertEqual(level2_encoder.target_bitrate, 1500000)
         with self.assertRaises(ValueError):
             encoder.encode(self.create_video_frame(640, 480, 0))
+        with self.assertRaisesRegex(
+            ValueError, "Frame dimensions exceed the negotiated HEVC level at 30 fps"
+        ):
+            encoder.encode(self.create_video_frame(192, 128, 0))
         payloads, timestamp = encoder.encode(self.create_video_frame(128, 96, 0))
         frames = H265Decoder().decode(
             JitterFrame(b"".join(map(h265_depayload, payloads)), timestamp)
