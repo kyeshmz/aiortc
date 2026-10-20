@@ -680,6 +680,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._fast_recovery_exit = None
         self._fast_recovery_transmit = False
         self._forward_tsn_chunk: Optional[ForwardTsnChunk] = None
+        self._forward_tsn_streams: dict[int, int] = {}
         self._flight_size = 0
         self._local_tsn = random32()
         self._last_sacked_tsn = tsn_minus_one(self._local_tsn)
@@ -1082,8 +1083,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 abort.params.append(
                     (SCTP_CAUSE_MISSING_PARAM, pack("!LH", 1, SCTP_STATE_COOKIE))
                 )
-                await self._send_chunk(abort)
                 self._set_state(self.State.CLOSED)
+                try:
+                    await self._send_chunk(abort)
+                except ConnectionError:
+                    pass
                 return
 
             # cancel T1 timer and process chunk
@@ -1274,14 +1278,15 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         elif uint32_gte(chunk.cumulative_tsn, self._fast_recovery_exit):
             self._fast_recovery_exit = None
 
-        if not self._sent_queue:
-            # there is no outstanding data, stop T3
+        self._update_advanced_peer_ack_point()
+
+        if not self._sent_queue and not self._forward_tsn_chunk:
+            # There is no outstanding DATA or FORWARD TSN, stop T3.
             self._t3_cancel()
         elif done:
             # the earliest outstanding chunk was acknowledged, restart T3
             self._t3_restart()
 
-        self._update_advanced_peer_ack_point()
         await self._data_channel_flush()
         await self._transmit()
 
@@ -1644,27 +1649,26 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Try to advance "Advanced.Peer.Ack.Point" according to RFC 3758.
         """
-        if uint32_gt(self._last_sacked_tsn, self._advanced_peer_ack_tsn):
+        if uint32_gte(self._last_sacked_tsn, self._advanced_peer_ack_tsn):
             self._advanced_peer_ack_tsn = self._last_sacked_tsn
+            self._forward_tsn_streams.clear()
+            self._forward_tsn_chunk = None
 
         # Retain reserved TSNs until FORWARD TSN can advance past them.
         while self._outbound_queue and self._outbound_queue[0]._abandoned:
             self._sent_queue.append(self._outbound_queue.popleft())
 
-        done = 0
-        streams = {}
         while self._sent_queue and self._sent_queue[0]._abandoned:
             chunk = self._sent_queue.popleft()
             self._advanced_peer_ack_tsn = chunk.tsn
-            done += 1
             if not (chunk.flags & SCTP_DATA_UNORDERED):
-                streams[chunk.stream_id] = chunk.stream_seq
+                self._forward_tsn_streams[chunk.stream_id] = chunk.stream_seq
 
-        if done:
+        if uint32_gt(self._advanced_peer_ack_tsn, self._last_sacked_tsn):
             # build FORWARD TSN
             self._forward_tsn_chunk = ForwardTsnChunk()
             self._forward_tsn_chunk.cumulative_tsn = self._advanced_peer_ack_tsn
-            self._forward_tsn_chunk.streams = list(streams.items())
+            self._forward_tsn_chunk.streams = list(self._forward_tsn_streams.items())
 
     def _update_rto(self, R: float) -> None:
         """

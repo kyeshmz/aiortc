@@ -733,7 +733,9 @@ class RTCSctpTransportTest(TestCase):
                 self.assertIsNone(client._t1_handle)
 
     @asynctest
-    async def test_init_ack_without_cookie_closes_when_abort_send_cancelled(self) -> None:
+    async def test_init_ack_without_cookie_closes_when_abort_send_cancelled(
+        self,
+    ) -> None:
         async with client_standalone() as client:
             channel = RTCDataChannel(
                 client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
@@ -751,7 +753,9 @@ class RTCSctpTransportTest(TestCase):
                 chunk.initiate_tag = 0x01020304
                 task = asyncio.create_task(
                     client._handle_data(
-                        serialize_packet(5000, 5000, client._local_verification_tag, chunk)
+                        serialize_packet(
+                            5000, 5000, client._local_verification_tag, chunk
+                        )
                     )
                 )
                 try:
@@ -2879,6 +2883,7 @@ class RTCSctpTransportTest(TestCase):
         async with client_standalone() as client:
             client._cwnd = 4 * USERDATA_MAX_LENGTH
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 4 * USERDATA_MAX_LENGTH
             client._send_chunk = mock_send_chunk  # type: ignore
@@ -2967,6 +2972,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_standalone() as client:
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 131072
             client._send_chunk = mock_send_chunk  # type: ignore
@@ -3044,6 +3050,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_standalone() as client:
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 131072
             client._send_chunk = mock_send_chunk  # type: ignore
@@ -3122,6 +3129,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_standalone() as client:
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 131072
             client._send_chunk = mock_send_chunk  # type: ignore
@@ -3202,6 +3210,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_standalone() as client:
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 131072
             client._send_chunk = mock_send_chunk  # type: ignore
@@ -3295,6 +3304,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_standalone() as client:
             client._last_sacked_tsn = 4294967295
+            client._advanced_peer_ack_tsn = 4294967295
             client._local_tsn = 0
             client._ssthresh = 131072
             client._send_chunk = mock_send_chunk  # type: ignore
