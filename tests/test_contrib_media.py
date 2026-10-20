@@ -7,7 +7,7 @@ import wave
 from collections.abc import Iterator
 from typing import Any, cast
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import av
 import av.container
@@ -156,6 +156,33 @@ class MediaTestCase(CodecTestCase):
 
 class MediaBlackholeTest(TestCase):
     @asynctest
+    async def test_duplicate_track_and_start(self) -> None:
+        track = AudioStreamTrack()
+        frame = av.AudioFrame(format="s16", layout="mono", samples=160)
+        recv = AsyncMock(side_effect=[frame, MediaStreamError()])
+        with patch.object(track, "recv", recv):
+            recorder = MediaBlackhole()
+            recorder.addTrack(track)
+            recorder.addTrack(track)
+            await recorder.start()
+            await recorder.start()
+            await asyncio.sleep(0)
+            await recorder.stop()
+        self.assertEqual(recv.await_count, 2)
+
+    @asynctest
+    async def test_stop_before_start(self) -> None:
+        track = AudioStreamTrack()
+        recv = AsyncMock()
+        with patch.object(track, "recv", recv):
+            recorder = MediaBlackhole()
+            recorder.addTrack(track)
+            await recorder.stop()
+            await recorder.start()
+            await asyncio.sleep(0)
+        recv.assert_not_awaited()
+
+    @asynctest
     async def test_audio(self) -> None:
         recorder = MediaBlackhole()
         recorder.addTrack(AudioStreamTrack())
@@ -247,6 +274,7 @@ class MediaRelayTest(MediaTestCase):
             self.assertEqual(frame2.samples, samples_per_frame)
 
         # stop a consumer
+        proxy1.stop()
         proxy1.stop()
 
         # continue reading
@@ -765,7 +793,9 @@ class MediaRecorderTest(MediaTestCase):
         recorder.addTrack(AudioStreamTrack())
         recorder.addTrack(VideoStreamTrack())
         await recorder.start()
+        await recorder.start()
         await asyncio.sleep(2)
+        await recorder.stop()
         await recorder.stop()
 
         # check output media

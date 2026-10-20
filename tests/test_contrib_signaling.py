@@ -76,6 +76,9 @@ class SignalingTest(TestCase):
         self.assertEqual(res[1], answer)
 
         await asyncio.gather(sig_server.close(), sig_client.close())
+        self.assertTrue(sig_server._read_pipe.closed)
+        self.assertTrue(sig_client._read_pipe.closed)
+        await asyncio.gather(sig_server.close(), sig_client.close())
 
         # cleanup mocks
         sig_client._write_pipe.close()
@@ -100,7 +103,12 @@ class SignalingTest(TestCase):
         res = await asyncio.gather(sig_client.send(answer), delay(sig_server.receive))
         self.assertEqual(res[1], answer)
 
-        await asyncio.gather(sig_server.close(), sig_client.close())
+        await sig_server.close()
+        await sig_server.close()
+        self.assertIs(await sig_client.receive(), BYE)
+        self.assertIsNone(await sig_client.receive())
+        await sig_client.close()
+        await sig_client.close()
 
     @asynctest
     async def test_tcp_socket_abrupt_disconnect(self) -> None:
@@ -149,7 +157,13 @@ class SignalingTest(TestCase):
         res = await asyncio.gather(sig_client.send(answer), delay(sig_server.receive))
         self.assertEqual(res[1], answer)
 
-        await asyncio.gather(sig_server.close(), sig_client.close())
+        await sig_server.close()
+        await sig_server.close()
+        self.assertIs(await sig_client.receive(), BYE)
+        self.assertIsNone(await sig_client.receive())
+        await sig_client.close()
+        await sig_client.close()
+        self.assertFalse(os.path.exists(args.signaling_path))
 
     @asynctest
     async def test_unix_socket_abrupt_disconnect(self) -> None:
