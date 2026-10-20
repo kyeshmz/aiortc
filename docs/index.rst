@@ -59,6 +59,7 @@ the ``aiortc`` code to ensure best-in-class code quality.
    examples
    api
    helpers
+   hevc
    contributing
    changelog
    license
