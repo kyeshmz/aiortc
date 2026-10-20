@@ -1304,6 +1304,8 @@ class RTCSctpTransportTest(TestCase):
                 with self.subTest(initial_tsn=initial_tsn, flags=flags):
                     async with client_and_server() as (client, server):
                         client._local_tsn = initial_tsn
+                        client._last_sacked_tsn = tsn_minus_one(initial_tsn)
+                        client._advanced_peer_ack_tsn = tsn_minus_one(initial_tsn)
                         local = RTCDataChannel(
                             client,
                             RTCDataChannelParameters(
