@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import time
 from collections.abc import AsyncGenerator, Generator
+from dataclasses import fields
+from itertools import permutations
 from typing import TypeVar, cast
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -325,6 +327,42 @@ class SctpPacketTest(TestCase):
         self.assertEqual(param.result, 1)
         self.assertEqual(bytes(param), param_data)
 
+    def test_reconfig_parameter_dataclass_contracts(self) -> None:
+        cases = (
+            (
+                StreamResetOutgoingParam(1, 2, 3, [4, 5]),
+                bytes.fromhex("00000001000000020000000300040005"),
+                ("request_sequence", "response_sequence", "last_tsn", "streams"),
+                "StreamResetOutgoingParam(request_sequence=1, response_sequence=2, "
+                "last_tsn=3, streams=[4, 5])",
+            ),
+            (
+                StreamResetResponseParam(1, 2),
+                bytes.fromhex("0000000100000002"),
+                ("response_sequence", "result"),
+                "StreamResetResponseParam(response_sequence=1, result=2)",
+            ),
+            (
+                StreamAddOutgoingParam(1, 2),
+                bytes.fromhex("0000000100020000"),
+                ("request_sequence", "new_streams"),
+                "StreamAddOutgoingParam(request_sequence=1, new_streams=2)",
+            ),
+        )
+        for param, wire, field_names, expected_repr in cases:
+            with self.subTest(parameter=type(param).__name__):
+                self.assertEqual(bytes(param), wire)
+                self.assertEqual(type(param).parse(wire), param)
+                self.assertEqual(
+                    tuple(field.name for field in fields(param)), field_names
+                )
+                self.assertEqual(repr(param), expected_repr)
+        first = StreamResetOutgoingParam(1, 2, 3)
+        second = StreamResetOutgoingParam(1, 2, 3)
+        first.streams.append(4)
+        self.assertEqual(second.streams, [])
+        self.assertNotEqual(first, second)
+
     def test_parse_sack(self) -> None:
         data = load("sctp_sack.bin")
         chunk = self.roundtrip_packet(data, SackChunk)
@@ -413,6 +451,30 @@ class SctpStreamTest(TestCase):
         with self.assertRaises(AssertionError) as cm:
             stream.add_chunk(chunks[0])
         self.assertEqual(str(cm.exception), "duplicate chunk in reassembly")
+
+    def test_fragment_permutations_across_serial_rollover(self) -> None:
+        for tsns in (
+            (0, 1, 2, 3),
+            (0x7FFFFFFE, 0x7FFFFFFF, 0x80000000, 0x80000001),
+            (0xFFFFFFFE, 0xFFFFFFFF, 0, 1),
+        ):
+            for order in permutations(range(4)):
+                with self.subTest(tsns=tsns, order=order):
+                    stream = InboundStream()
+                    chunks = ChunkFactory().create([b"one", b"two", b"three", b"four"])
+                    for chunk, tsn in zip(chunks, tsns):
+                        chunk.tsn = tsn
+                    for index in order:
+                        stream.add_chunk(chunks[index])
+                        with self.assertRaisesRegex(
+                            AssertionError, "duplicate chunk in reassembly"
+                        ):
+                            stream.add_chunk(chunks[index])
+                    self.assertEqual(
+                        list(stream.pop_messages()), [(456, 123, b"onetwothreefour")]
+                    )
+                    self.assertEqual(stream.reassembly, [])
+                    self.assertEqual(stream.sequence_number, 1)
 
     def test_whole_in_order(self) -> None:
         stream = InboundStream()
@@ -1315,6 +1377,40 @@ class RTCSctpTransportTest(TestCase):
                         )
                         self.assertEqual(server._advertised_rwnd, before_window)
                         self.assertEqual(stream.reassembly, [])
+
+    @asynctest
+    async def test_reconfig_subclasses_preserve_wire_types(self) -> None:
+        class Reset(StreamResetOutgoingParam):
+            pass
+
+        class Response(StreamResetResponseParam):
+            pass
+
+        class Add(StreamAddOutgoingParam):
+            pass
+
+        cases = (
+            (
+                Reset(1, 2, 3),
+                bytes.fromhex("82000014000d0010000000010000000200000003"),
+            ),
+            (Response(1, 2), bytes.fromhex("820000100010000c0000000100000002")),
+            (Add(1, 2), bytes.fromhex("820000100011000c0000000100020000")),
+        )
+        async with client_and_server() as (client, server):
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            with patch.object(
+                client.transport, "_send_data", new_callable=AsyncMock
+            ) as send:
+                for param, expected in cases:
+                    with self.subTest(parameter=type(param).__name__):
+                        send.reset_mock()
+                        await client._send_reconfig_param(param)
+                        send.assert_awaited_once()
+                        self.assertEqual(send.await_args.args[0][12:], expected)
+                        self.assertEqual(type(param).parse(bytes(param)), param)
 
     @asynctest
     async def test_unknown_reconfig_parameter_does_not_hide_stream_add(self) -> None:

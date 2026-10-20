@@ -9,7 +9,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from struct import pack, unpack_from
-from typing import Deque, Optional, Union, cast
+from typing import ClassVar, Deque, Optional, Union, cast
 
 from google_crc32c import value as crc32c
 from pyee.asyncio import AsyncIOEventEmitter
@@ -471,6 +471,8 @@ def serialize_packet(
 
 @dataclass
 class StreamResetOutgoingParam:
+    type: ClassVar[int] = SCTP_STR_RESET_OUT_REQUEST
+
     request_sequence: int
     response_sequence: int
     last_tsn: int
@@ -500,6 +502,8 @@ class StreamResetOutgoingParam:
 
 @dataclass
 class StreamAddOutgoingParam:
+    type: ClassVar[int] = SCTP_STR_RESET_ADD_OUT_STREAMS
+
     request_sequence: int
     new_streams: int
 
@@ -515,6 +519,8 @@ class StreamAddOutgoingParam:
 
 @dataclass
 class StreamResetResponseParam:
+    type: ClassVar[int] = SCTP_STR_RESET_RESPONSE
+
     response_sequence: int
     result: int
 
@@ -535,9 +541,12 @@ RECONFIG_PARAM_TYPES: dict[
         type[StreamAddOutgoingParam],
     ],
 ] = {
-    13: StreamResetOutgoingParam,
-    16: StreamResetResponseParam,
-    17: StreamAddOutgoingParam,
+    cls.type: cls
+    for cls in (
+        StreamResetOutgoingParam,
+        StreamResetResponseParam,
+        StreamAddOutgoingParam,
+    )
 }
 
 
@@ -551,14 +560,15 @@ class InboundStream:
             self.reassembly.append(chunk)
             return
 
-        for i, rchunk in enumerate(self.reassembly):
-            # should never happen, the chunk should have been eliminated
-            # as a duplicate when _mark_received() is called
+        for i in range(len(self.reassembly) - 1, -1, -1):
+            rchunk = self.reassembly[i]
             assert rchunk.tsn != chunk.tsn, "duplicate chunk in reassembly"
 
-            if uint32_gt(rchunk.tsn, chunk.tsn):
-                self.reassembly.insert(i, chunk)
-                break
+            if uint32_gt(chunk.tsn, rchunk.tsn):
+                self.reassembly.insert(i + 1, chunk)
+                return
+
+        self.reassembly.insert(0, chunk)
 
     def pop_messages(self) -> Iterator[tuple[int, int, bytes]]:
         pos = 0
@@ -1336,7 +1346,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._reconfig_response_seq = param.request_sequence
 
             await self._send_reconfig_param(response_param)
-        elif isinstance(param, StreamResetResponseParam):
+        else:
             if (
                 self._reconfig_request
                 and param.response_sequence == self._reconfig_request.request_sequence
@@ -1426,11 +1436,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ],
     ) -> None:
         chunk = ReconfigChunk()
-        for k, cls in RECONFIG_PARAM_TYPES.items():
-            if isinstance(param, cls):
-                param_type = k
-                break
-        chunk.params.append((param_type, bytes(param)))
+        chunk.params.append((param.type, bytes(param)))
 
         self.__log_debug(">> %s", param)
         await self._send_chunk(chunk)
