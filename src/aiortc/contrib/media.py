@@ -240,7 +240,7 @@ class PlayerStreamTrack(MediaStreamTrack):
             raise MediaStreamError
         if isinstance(data, Frame):
             data_time = data.time
-        elif isinstance(data, Packet):
+        else:
             data_time = float(data.pts * data.time_base)
 
         # control playback rate
