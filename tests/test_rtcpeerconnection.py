@@ -34,6 +34,7 @@ from aiortc.rtcrtpparameters import (
 from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.sdp import SessionDescription
 from aiortc.stats import RTCStatsReport
+from av import VideoFrame
 
 from .test_contrib_media import MediaTestCase
 from .utils import asynctest, lf2crlf
@@ -376,6 +377,36 @@ class RTCRtpCodecParametersTest(TestCase):
             ],
         )
 
+    def test_filter_preferred_codecs_no_compatible_h265_level(self) -> None:
+        self.assertEqual(
+            filter_preferred_codecs(
+                [
+                    RTCRtpCodecParameters(
+                        mimeType="video/H265",
+                        clockRate=90000,
+                        payloadType=103,
+                        parameters={
+                            "profile-id": "1",
+                            "tier-flag": "0",
+                            "level-id": "120",
+                        },
+                    )
+                ],
+                [
+                    RTCRtpCodecCapability(
+                        mimeType="video/H265",
+                        clockRate=90000,
+                        parameters={
+                            "profile-id": "1",
+                            "tier-flag": "0",
+                            "level-id": "93",
+                        },
+                    )
+                ],
+            ),
+            [],
+        )
+
     def test_is_codec_compatible(self) -> None:
         # compatible: identical
         self.assertTrue(
@@ -640,6 +671,78 @@ class RTCPeerConnectionTest(TestCase):
         self.assertFalse("a=end-of-candidates" in pc.remoteDescription.sdp)
         await pc.addIceCandidate(None)
         self.assertTrue("a=end-of-candidates" in pc.remoteDescription.sdp)
+
+    @asynctest
+    async def test_addIceCandidate_routes_to_unbundled_media(self) -> None:
+        for use_mid in [True, False]:
+            with self.subTest(use_mid=use_mid):
+                pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                try:
+                    pc1.addTransceiver("audio")
+                    pc1.addTransceiver("video")
+                    pc1.createDataChannel("test")
+                    offer = SessionDescription.parse((await pc1.createOffer()).sdp)
+                    offer.group = []
+                    await pc2.setRemoteDescription(
+                        RTCSessionDescription(sdp=str(offer), type="offer")
+                    )
+                    transports = [
+                        t.receiver.transport.transport for t in pc2.getTransceivers()
+                    ] + [pc2.sctp.transport.transport]
+                    self.assertEqual(
+                        [t.getRemoteCandidates() for t in transports], [[], [], []]
+                    )
+                    candidate = RTCIceCandidate(
+                        component=1,
+                        foundation="0",
+                        ip="192.0.2.1",
+                        port=33543,
+                        priority=2122252543,
+                        protocol="udp",
+                        type="host",
+                        sdpMid="1" if use_mid else None,
+                        sdpMLineIndex=None if use_mid else 1,
+                    )
+                    await pc2.addIceCandidate(candidate)
+                    expected = [
+                        [],
+                        [
+                            RTCIceCandidate(
+                                component=1,
+                                foundation="0",
+                                ip="192.0.2.1",
+                                port=33543,
+                                priority=2122252543,
+                                protocol="udp",
+                                type="host",
+                            )
+                        ],
+                        [],
+                    ]
+                    self.assertEqual(
+                        [t.getRemoteCandidates() for t in transports], expected
+                    )
+                    remote = SessionDescription.parse(pc2.remoteDescription.sdp)
+                    self.assertEqual(
+                        [(m.kind, m.rtp.muxId) for m in remote.media],
+                        [("audio", "0"), ("video", "1"), ("application", "2")],
+                    )
+                    self.assertEqual([m.ice_candidates for m in remote.media], expected)
+                    self.assertEqual(
+                        [m.ice_candidates_complete for m in remote.media],
+                        [False, False, False],
+                    )
+                    await pc2.addIceCandidate(None)
+                    remote = SessionDescription.parse(pc2.remoteDescription.sdp)
+                    self.assertEqual(
+                        [m.ice_candidates_complete for m in remote.media],
+                        [True, True, True],
+                    )
+                    self.assertEqual([m.ice_candidates for m in remote.media], expected)
+                finally:
+                    await pc1.close()
+                    await pc2.close()
 
     @asynctest
     async def test_addIceCandidate_before_setremotedescription(self) -> None:
@@ -3063,6 +3166,44 @@ a=rtpmap:0 PCMU/8000
         )
 
     @asynctest
+    async def test_connect_video_without_rtx_ssrc(self) -> None:
+        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        try:
+            pc1.addTrack(VideoStreamTrack())
+            pc1.getTransceivers()[0].setCodecPreferences(
+                [
+                    RTCRtpCodecCapability(mimeType="video/VP8", clockRate=90000),
+                    RTCRtpCodecCapability(mimeType="video/rtx", clockRate=90000),
+                ]
+            )
+            await pc1.setLocalDescription(await pc1.createOffer())
+            offer = SessionDescription.parse(pc1.localDescription.sdp)
+            offer.media[0].ssrc = offer.media[0].ssrc[:1]
+            offer.media[0].ssrc_group = []
+            await pc2.setRemoteDescription(
+                RTCSessionDescription(sdp=str(offer), type="offer")
+            )
+            await pc2.setLocalDescription(await pc2.createAnswer())
+            await pc1.setRemoteDescription(pc2.localDescription)
+
+            remote = SessionDescription.parse(pc2.remoteDescription.sdp).media[0]
+            self.assertEqual(
+                [(c.mimeType, c.payloadType, c.parameters) for c in remote.rtp.codecs],
+                [("video/VP8", 97, {}), ("video/rtx", 98, {"apt": 97})],
+            )
+            self.assertEqual(len(remote.ssrc), 1)
+            self.assertEqual(remote.ssrc_group, [])
+            frame = await asyncio.wait_for(pc2.getReceivers()[0].track.recv(), 5)
+            self.assertIsInstance(frame, VideoFrame)
+            assert isinstance(frame, VideoFrame)
+            self.assertEqual((frame.width, frame.height), (640, 480))
+            self.assertEqual(frame.format.name, "yuv420p")
+        finally:
+            await pc1.close()
+            await pc2.close()
+
+    @asynctest
     async def test_connect_video_codec_preferences_offerer(self) -> None:
         VIDEO_SDP = H264_SDP + VP8_SDP
 
@@ -4806,6 +4947,91 @@ a=rtpmap:0 PCMU/8000
         # close
         await pc1.close()
         await pc2.close()
+
+    @asynctest
+    async def test_setRemoteDescription_no_common_preferred_audio(self) -> None:
+        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        try:
+            pc1.addTransceiver("audio").setCodecPreferences(
+                [
+                    RTCRtpCodecCapability(
+                        mimeType="audio/PCMA", clockRate=8000, channels=1
+                    )
+                ]
+            )
+            pc2.addTransceiver("audio").setCodecPreferences(
+                [
+                    RTCRtpCodecCapability(
+                        mimeType="audio/PCMU", clockRate=8000, channels=1
+                    )
+                ]
+            )
+            offer = await pc1.createOffer()
+            self.assertEqual(
+                SessionDescription.parse(offer.sdp).media[0].rtp.codecs,
+                [
+                    RTCRtpCodecParameters(
+                        mimeType="audio/PCMA",
+                        clockRate=8000,
+                        channels=1,
+                        payloadType=8,
+                    )
+                ],
+            )
+            with self.assertRaises(OperationError) as cm:
+                await pc2.setRemoteDescription(offer)
+            self.assertEqual(
+                str(cm.exception),
+                "Failed to set remote audio description send parameters",
+            )
+            self.assertIsNone(pc2.remoteDescription)
+            self.assertEqual(pc2.signalingState, "stable")
+        finally:
+            await pc1.close()
+            await pc2.close()
+
+    @asynctest
+    async def test_setRemoteDescription_video_preference_without_matching_rtx(
+        self,
+    ) -> None:
+        pc1 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        pc2 = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        try:
+            pc1.addTransceiver("video")
+            pc2.addTransceiver("video").setCodecPreferences(
+                [
+                    RTCRtpCodecCapability(mimeType="video/VP8", clockRate=90000),
+                    RTCRtpCodecCapability(mimeType="video/rtx", clockRate=90000),
+                ]
+            )
+            offer = SessionDescription.parse((await pc1.createOffer()).sdp)
+            offer.media[0].rtp.codecs = [
+                c for c in offer.media[0].rtp.codecs if c.payloadType != 98
+            ]
+            offer.media[0].fmt = [pt for pt in offer.media[0].fmt if pt != 98]
+            await pc2.setRemoteDescription(
+                RTCSessionDescription(sdp=str(offer), type="offer")
+            )
+            answer = await pc2.createAnswer()
+            self.assertEqual(
+                SessionDescription.parse(answer.sdp).media[0].rtp.codecs,
+                [
+                    RTCRtpCodecParameters(
+                        mimeType="video/VP8",
+                        clockRate=90000,
+                        payloadType=97,
+                        rtcpFeedback=[
+                            RTCRtcpFeedback(type="nack"),
+                            RTCRtcpFeedback(type="nack", parameter="pli"),
+                            RTCRtcpFeedback(type="goog-remb"),
+                        ],
+                    )
+                ],
+            )
+        finally:
+            await pc1.close()
+            await pc2.close()
 
     @asynctest
     async def test_setRemoteDescription_no_common_video(self) -> None:
