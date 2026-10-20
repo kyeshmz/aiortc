@@ -8,6 +8,7 @@ from pyee.asyncio import AsyncIOEventEmitter
 
 from . import clock, rtp, sdp
 from .codecs import CODECS, HEADER_EXTENSIONS, is_rtx
+from .codecs.h265 import negotiate_h265_parameters, parse_h265_parameters
 from .events import RTCTrackEvent
 from .exceptions import (
     InternalError,
@@ -61,9 +62,13 @@ def filter_preferred_codecs(
     filtered = []
     for pref in filter(lambda x: not is_rtx(x), preferred):
         for codec in codecs:
-            if (
-                codec.mimeType.lower() == pref.mimeType.lower()
-                and codec.parameters == pref.parameters
+            if codec.mimeType.lower() == pref.mimeType.lower() and (
+                codec.parameters == pref.parameters
+                or (
+                    codec.mimeType.lower() == "video/h265"
+                    and parse_h265_parameters(codec.parameters)
+                    <= parse_h265_parameters(pref.parameters)
+                )
             ):
                 filtered.append(codec)
 
@@ -99,6 +104,10 @@ def find_common_codecs(
         for codec in local_codecs:
             if is_codec_compatible(codec, c):
                 codec = copy.deepcopy(codec)
+                if codec.mimeType.lower() == "video/h265":
+                    codec.parameters = negotiate_h265_parameters(
+                        codec.parameters, c.parameters
+                    )
                 if c.payloadType in rtp.DYNAMIC_PAYLOAD_TYPES:
                     codec.payloadType = c.payloadType
                 codec.rtcpFeedback = list(
@@ -141,6 +150,13 @@ def is_codec_compatible(a: RTCRtpCodecParameters, b: RTCRtpCodecParameters) -> b
 
         try:
             return packetization(a) == packetization(b) and profile(a) == profile(b)
+        except ValueError:
+            return False
+
+    if a.mimeType.lower() == "video/h265":
+        try:
+            negotiate_h265_parameters(a.parameters, b.parameters)
+            return True
         except ValueError:
             return False
 
@@ -388,8 +404,8 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         """
         The current signaling state.
 
-        Possible values: `"closed"`, `"have-local-offer"`, `"have-remote-offer`",
-        `"stable"`.
+        Possible values: `"closed"`, `"have-local-offer"`, `"have-remote-offer"`,
+        `"have-local-pranswer"`, `"have-remote-pranswer"`, `"stable"`.
 
         When the state changes, the `"signalingstatechange"` event is fired.
         """
@@ -690,7 +706,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                         mid=mid,
                     )
                 )
-            elif media_kind == "application":
+            else:
                 self.__sctp_mline_index = i
                 description.media.append(
                     create_media_description_for_sctp(
@@ -785,6 +801,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         """
         Change the local description associated with the connection.
 
+        Offers, answers, and provisional answers are supported. Rollback is not
+        supported.
+
         :param sessionDescription: An :class:`RTCSessionDescription` generated
                                     by :meth:`createOffer` or :meth:`createAnswer()`
                                     or `None` to implicitly create an offer or create
@@ -797,7 +816,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             # https://w3c.github.io/webrtc-pc/#dom-peerconnection-setlocaldescription
             # If left out, then setLocalDescription will implicitly create an offer
             # or create an answer, as needed.
-            if self.signalingState == "have-remote-offer":
+            if self.signalingState in ["have-remote-offer", "have-local-pranswer"]:
                 sessionDescription = await self.createAnswer()
             else:
                 sessionDescription = await self.createOffer()
@@ -818,12 +837,6 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         description.type = sessionDescription.type
         self.__validate_description(description, is_local=True)
 
-        # update signaling state
-        if description.type == "offer":
-            self.__setSignalingState("have-local-offer")
-        elif description.type == "answer":
-            self.__setSignalingState("stable")
-
         # assign MID
         for i, media in enumerate(description.media):
             mid = media.rtp.muxId
@@ -831,7 +844,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             if media.kind in ["audio", "video"]:
                 transceiver = self.__getTransceiverByMLineIndex(i)
                 transceiver._set_mid(mid)
-            elif media.kind == "application":
+            else:
                 self.__sctp.mid = mid
 
         # set ICE role
@@ -842,18 +855,14 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     iceTransport._role_set = True
 
         # set DTLS role
-        if description.type == "answer":
+        if description.type in ["answer", "pranswer"]:
             for i, media in enumerate(description.media):
                 if media.kind in ["audio", "video"]:
                     transceiver = self.__getTransceiverByMLineIndex(i)
                     transceiver.receiver.transport._set_role(media.dtls.role)
-                elif media.kind == "application":
+                    transceiver._setCurrentDirection(media.direction or "sendrecv")
+                else:
                     self.__sctp.transport._set_role(media.dtls.role)
-
-        # configure direction
-        for t in self.__transceivers:
-            if description.type in ["answer", "pranswer"]:
-                t._setCurrentDirection(and_direction(t.direction, t._offerDirection))
 
         # gather candidates
         await self.__gather()
@@ -861,7 +870,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             if media.kind in ["audio", "video"]:
                 transceiver = self.__getTransceiverByMLineIndex(i)
                 add_transport_description(media, transceiver.receiver.transport)
-            elif media.kind == "application":
+            else:
                 add_transport_description(media, self.__sctp.transport)
 
         # connect
@@ -870,15 +879,27 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # replace description
         if description.type == "answer":
             self.__currentLocalDescription = description
+            self.__currentRemoteDescription = self.__pendingRemoteDescription
             self.__pendingLocalDescription = None
+            self.__pendingRemoteDescription = None
         else:
             self.__pendingLocalDescription = description
+
+        if description.type == "offer":
+            self.__setSignalingState("have-local-offer")
+        elif description.type == "pranswer":
+            self.__setSignalingState("have-local-pranswer")
+        else:
+            self.__setSignalingState("stable")
 
     async def setRemoteDescription(
         self, sessionDescription: RTCSessionDescription
     ) -> None:
         """
         Changes the remote description associated with the connection.
+
+        Offers, answers, and provisional answers are supported. Rollback is not
+        supported.
 
         :param sessionDescription: An :class:`RTCSessionDescription` created from
                                     information received over the signaling channel.
@@ -898,7 +919,6 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         iceCandidates: dict[RTCIceTransport, sdp.MediaDescription] = {}
         trackEvents = []
         for i, media in enumerate(description.media):
-            dtlsTransport: Optional[RTCDtlsTransport] = None
             self.__seenMids.add(media.rtp.muxId)
             if media.kind in ["audio", "video"]:
                 # find transceiver
@@ -934,7 +954,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 )
 
                 # configure direction
-                direction = reverse_direction(media.direction)
+                direction = reverse_direction(media.direction or "sendrecv")
                 if description.type in ["answer", "pranswer"]:
                     transceiver._setCurrentDirection(direction)
                 else:
@@ -961,7 +981,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 self.__remoteDtls[transceiver] = media.dtls
                 self.__remoteIce[transceiver] = media.ice
 
-            elif media.kind == "application":
+            else:
                 if not self.__sctp:
                     self.__createSctpTransport()
                 if self.__sctp.mid is None:
@@ -982,23 +1002,22 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 self.__remoteDtls[self.__sctp] = media.dtls
                 self.__remoteIce[self.__sctp] = media.ice
 
-            if dtlsTransport is not None:
-                # add ICE candidates
-                iceTransport = dtlsTransport.transport
-                iceCandidates[iceTransport] = media
+            # add ICE candidates
+            iceTransport = dtlsTransport.transport
+            iceCandidates[iceTransport] = media
 
-                # set ICE role
-                if description.type == "offer" and not iceTransport._role_set:
-                    iceTransport._connection.ice_controlling = media.ice.iceLite
-                    iceTransport._role_set = True
+            # set ICE role
+            if description.type == "offer" and not iceTransport._role_set:
+                iceTransport._connection.ice_controlling = media.ice.iceLite
+                iceTransport._role_set = True
 
-                # set DTLS role
-                if description.type == "offer" and media.dtls.role == "client":
-                    dtlsTransport._set_role(role="server")
-                if description.type == "answer":
-                    dtlsTransport._set_role(
-                        role="server" if media.dtls.role == "client" else "client"
-                    )
+            # set DTLS role
+            if description.type == "offer" and media.dtls.role == "client":
+                dtlsTransport._set_role(role="server")
+            if description.type in ["answer", "pranswer"]:
+                dtlsTransport._set_role(
+                    role="server" if media.dtls.role == "client" else "client"
+                )
 
         # remove bundled transports
         bundle = next((x for x in description.group if x.semantic == "BUNDLE"), None)
@@ -1056,18 +1075,21 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # connect
         asyncio.ensure_future(self.__connect())
 
-        # update signaling state
-        if description.type == "offer":
-            self.__setSignalingState("have-remote-offer")
-        elif description.type == "answer":
-            self.__setSignalingState("stable")
-
         # replace description
         if description.type == "answer":
             self.__currentRemoteDescription = description
+            self.__currentLocalDescription = self.__pendingLocalDescription
+            self.__pendingLocalDescription = None
             self.__pendingRemoteDescription = None
         else:
             self.__pendingRemoteDescription = description
+
+        if description.type == "offer":
+            self.__setSignalingState("have-remote-offer")
+        elif description.type == "pranswer":
+            self.__setSignalingState("have-remote-pranswer")
+        else:
+            self.__setSignalingState("stable")
 
     async def __connect(self) -> None:
         for transceiver in self.__transceivers:
@@ -1264,8 +1286,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         return receiveParameters
 
     def __setSignalingState(self, state: str) -> None:
-        self.__signalingState = state
-        self.emit("signalingstatechange")
+        if state != self.__signalingState:
+            self.__signalingState = state
+            self.emit("signalingstatechange")
 
     def __updateConnectionState(self) -> None:
         # compute new state
@@ -1347,6 +1370,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
     def __validate_description(
         self, description: sdp.SessionDescription, is_local: bool
     ) -> None:
+        if description.type not in ["offer", "answer", "pranswer"]:
+            raise ValueError(f"Unsupported description type '{description.type}'")
+
         # check description is compatible with signaling state
         if is_local:
             if description.type == "offer":
@@ -1355,13 +1381,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                         "Cannot handle offer in signaling state "
                         f'"{self.signalingState}"'
                     )
-            elif description.type == "answer":
+            else:
                 if self.signalingState not in [
                     "have-remote-offer",
                     "have-local-pranswer",
                 ]:
                     raise InvalidStateError(
-                        "Cannot handle answer in signaling state "
+                        f"Cannot handle {description.type} in signaling state "
                         f'"{self.signalingState}"'
                     )
         else:
@@ -1371,17 +1397,20 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                         "Cannot handle offer in signaling state "
                         f'"{self.signalingState}"'
                     )
-            elif description.type == "answer":
+            else:
                 if self.signalingState not in [
                     "have-local-offer",
                     "have-remote-pranswer",
                 ]:
                     raise InvalidStateError(
-                        "Cannot handle answer in signaling state "
+                        f"Cannot handle {description.type} in signaling state "
                         f'"{self.signalingState}"'
                     )
 
         for media in description.media:
+            if media.kind not in ["audio", "video", "application"]:
+                raise ValueError(f"Unsupported media kind '{media.kind}'")
+
             # check ICE credentials were provided
             if not media.ice.usernameFragment or not media.ice.password:
                 raise ValueError("ICE username fragment or password is missing")

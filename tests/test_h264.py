@@ -3,6 +3,7 @@ import io
 from contextlib import redirect_stderr
 from unittest import TestCase
 
+import av
 from aiortc.codecs import get_decoder, get_encoder
 from aiortc.codecs.h264 import H264Decoder, H264Encoder, H264PayloadDescriptor
 from aiortc.jitterbuffer import JitterFrame
@@ -82,6 +83,22 @@ class H264PayloadDescriptorTest(TestCase):
 
 
 class H264Test(CodecTestCase):
+    def test_encoder_buffering(self) -> None:
+        encoder = H264Encoder()
+        codec = self.ensureIsInstance(
+            av.CodecContext.create("libx264", "w"), av.VideoCodecContext
+        )
+        codec.width = 320
+        codec.height = 240
+        codec.bit_rate = 1000000
+        codec.pix_fmt = "yuv420p"
+        codec.time_base = fractions.Fraction(1, 30)
+        codec.framerate = fractions.Fraction(30)
+        codec.thread_count = 1
+        encoder.codec = codec
+        self.assertEqual(encoder.encode(self.create_video_frame(320, 240, 0)), ([], 0))
+        self.assertEqual(len(codec.encode(None)), 1)
+
     def test_decoder(self) -> None:
         decoder = get_decoder(H264_CODEC)
         self.assertIsInstance(decoder, H264Decoder)

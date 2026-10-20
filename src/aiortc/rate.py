@@ -153,9 +153,8 @@ class AimdRateControl:
         self, new_bitrate: int, last_ms: int, now_ms: int
     ) -> int:
         alpha = 1.08
-        if last_ms is not None:
-            elapsed_ms = min(now_ms - last_ms, 1000)
-            alpha = pow(alpha, elapsed_ms / 1000)
+        elapsed_ms = min(now_ms - last_ms, 1000)
+        alpha = pow(alpha, elapsed_ms / 1000)
         return int(max((alpha - 1) * new_bitrate, 1000))
 
     def _near_max_rate_increase(self) -> int:
@@ -556,15 +555,14 @@ class RemoteBitrateEstimator:
                 arrival_time_ms,
             )
 
-        if not update_estimate:
-            if (
-                self.last_update_ms is None
-                or (arrival_time_ms - self.last_update_ms)
-                > self.rate_control.feedback_interval()
-            ):
-                update_estimate = True
-            elif self.detector.state() == BandwidthUsage.OVERUSING:
-                update_estimate = True
+        if (
+            self.last_update_ms is None
+            or (arrival_time_ms - self.last_update_ms)
+            > self.rate_control.feedback_interval()
+        ):
+            update_estimate = True
+        elif self.detector.state() == BandwidthUsage.OVERUSING:
+            update_estimate = True
 
         if update_estimate:
             target_bitrate = self.rate_control.update(

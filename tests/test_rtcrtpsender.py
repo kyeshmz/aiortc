@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from aiortc import MediaStreamTrack
 from aiortc.codecs import PCMU_CODEC
+from aiortc.codecs.vpx import Vp8Encoder
 from aiortc.exceptions import InvalidStateError
 from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from aiortc.rtcrtpparameters import (
@@ -20,10 +21,15 @@ from aiortc.rtp import (
     RTCP_PSFB_FIR,
     RTCP_PSFB_PLI,
     RTCP_RTPFB_NACK,
+    RtcpByePacket,
+    RtcpPacket,
     RtcpPsfbPacket,
     RtcpReceiverInfo,
     RtcpRrPacket,
     RtcpRtpfbPacket,
+    RtcpSdesPacket,
+    RtcpSenderInfo,
+    RtcpSrPacket,
     RtpPacket,
     is_rtcp,
     pack_remb_fci,
@@ -51,6 +57,75 @@ class BuggyStreamTrack(MediaStreamTrack):
 
 
 class RTCRtpSenderTest(TestCase):
+    @asynctest
+    async def test_sender_report_without_cname(self) -> None:
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def capture(data: bytes) -> None:
+            await queue.put(data)
+
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            sender = RTCRtpSender("audio", local_transport)
+            sender._ssrc = 1234
+            with patch.object(local_transport, "_send_rtp", side_effect=capture):
+                try:
+                    await sender.send(RTCRtpSendParameters(codecs=[PCMU_CODEC]))
+                    data = await asyncio.wait_for(queue.get(), timeout=2)
+                    self.assertEqual(
+                        RtcpPacket.parse(data),
+                        [
+                            RtcpSrPacket(
+                                ssrc=1234,
+                                sender_info=RtcpSenderInfo(
+                                    ntp_timestamp=0,
+                                    rtp_timestamp=0,
+                                    packet_count=0,
+                                    octet_count=0,
+                                ),
+                            )
+                        ],
+                    )
+                finally:
+                    await sender.stop()
+                self.assertEqual(
+                    RtcpPacket.parse(queue.get_nowait()),
+                    [RtcpByePacket(sources=[1234])],
+                )
+                self.assertTrue(queue.empty())
+
+    @asynctest
+    async def test_feedback_only_changes_its_target_sender(self) -> None:
+        encoder = Vp8Encoder()
+        track = VideoStreamTrack()
+        try:
+            async with dummy_dtls_transport_pair() as (local_transport, _):
+                sender = RTCRtpSender(track, local_transport)
+                sender._ssrc = 1234
+                with patch("aiortc.rtcrtpsender.get_encoder", return_value=encoder):
+                    self.assertIsNotNone(await sender._next_encoded_frame(VP8_CODEC))
+                self.assertEqual(encoder.target_bitrate, 500000)
+                await sender._handle_rtcp_packet(
+                    RtcpPsfbPacket(
+                        fmt=RTCP_PSFB_APP,
+                        ssrc=1,
+                        media_ssrc=0,
+                        fci=pack_remb_fci(1000000, [1234]),
+                    )
+                )
+                self.assertEqual(encoder.target_bitrate, 1000000)
+                await sender._handle_rtcp_packet(
+                    RtcpPsfbPacket(
+                        fmt=RTCP_PSFB_APP,
+                        ssrc=1,
+                        media_ssrc=0,
+                        fci=pack_remb_fci(500000, [5678]),
+                    )
+                )
+                await sender._handle_rtcp_packet(RtcpSdesPacket())
+                self.assertEqual(encoder.target_bitrate, 1000000)
+        finally:
+            track.stop()
+
     def test_capabilities(self) -> None:
         # audio
         capabilities = RTCRtpSender.getCapabilities("audio")
@@ -108,6 +183,17 @@ class RTCRtpSenderTest(TestCase):
                         "level-asymmetry-allowed": "1",
                         "packetization-mode": "1",
                         "profile-level-id": "42e01f",
+                    },
+                ),
+                RTCRtpCodecCapability(
+                    mimeType="video/H265",
+                    clockRate=90000,
+                    parameters={
+                        "profile-id": "1",
+                        "tier-flag": "0",
+                        "level-id": "93",
+                        "tx-mode": "SRST",
+                        "sprop-max-don-diff": "0",
                     },
                 ),
             ],

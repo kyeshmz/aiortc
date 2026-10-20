@@ -224,21 +224,38 @@ class RTCDtlsParameters:
 
 
 class DataReceiver(Protocol):
-    async def _handle_data(self, data: bytes) -> None: ...
+    async def _handle_data(self, data: bytes) -> None:
+        """Accept decrypted DTLS application bytes.
+
+        The receiver remains responsible for application-level parsing, such as SCTP.
+        """
 
 
 class RtpReceiver(Protocol):
-    def _handle_disconnect(self) -> None: ...
-    async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
-    async def _handle_rtp_packet(
-        self, packet: RtpPacket, arrival_time_ms: int
-    ) -> None: ...
+    def _handle_disconnect(self) -> None:
+        """Notify the receiver that its transport disconnected.
+
+        This callback does not guarantee complete receiver shutdown.
+        """
+
+    async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
+        """Handle one parsed RTCP packet routed to this receiver."""
+
+    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
+        """Handle one parsed RTP packet routed to this receiver.
+
+        ``arrival_time_ms`` is the transport's receive timestamp in milliseconds.
+        """
 
 
 class RtpSender(Protocol):
     _ssrc: int
 
-    async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None: ...
+    async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
+        """Handle one parsed RTCP packet routed to this sender.
+
+        Filter embedded report or feedback SSRCs as needed for this sender.
+        """
 
 
 class RtpRouter:
@@ -573,8 +590,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             for receiver in self._rtp_router.receivers:
                 receiver._handle_disconnect()
         except Exception as exc:
-            if not isinstance(exc, asyncio.CancelledError):
-                self.__log_warning(traceback.format_exc())
+            self.__log_warning(traceback.format_exc())
             raise exc
         finally:
             self._set_state(State.CLOSED)

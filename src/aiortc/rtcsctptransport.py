@@ -9,7 +9,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from struct import pack, unpack_from
-from typing import Deque, Optional, Union, cast
+from typing import ClassVar, Deque, Optional, Union, cast
 
 from google_crc32c import value as crc32c
 from pyee.asyncio import AsyncIOEventEmitter
@@ -53,6 +53,7 @@ REMOTE_DEFAULT_MAX_MESSAGE_SIZE = 65536
 
 # protocol constants
 SCTP_CAUSE_INVALID_STREAM = 0x0001
+SCTP_CAUSE_MISSING_PARAM = 0x0002
 SCTP_CAUSE_STALE_COOKIE = 0x0003
 
 SCTP_DATA_LAST_FRAG = 0x01
@@ -470,6 +471,8 @@ def serialize_packet(
 
 @dataclass
 class StreamResetOutgoingParam:
+    type: ClassVar[int] = SCTP_STR_RESET_OUT_REQUEST
+
     request_sequence: int
     response_sequence: int
     last_tsn: int
@@ -499,6 +502,8 @@ class StreamResetOutgoingParam:
 
 @dataclass
 class StreamAddOutgoingParam:
+    type: ClassVar[int] = SCTP_STR_RESET_ADD_OUT_STREAMS
+
     request_sequence: int
     new_streams: int
 
@@ -514,6 +519,8 @@ class StreamAddOutgoingParam:
 
 @dataclass
 class StreamResetResponseParam:
+    type: ClassVar[int] = SCTP_STR_RESET_RESPONSE
+
     response_sequence: int
     result: int
 
@@ -534,9 +541,12 @@ RECONFIG_PARAM_TYPES: dict[
         type[StreamAddOutgoingParam],
     ],
 ] = {
-    13: StreamResetOutgoingParam,
-    16: StreamResetResponseParam,
-    17: StreamAddOutgoingParam,
+    cls.type: cls
+    for cls in (
+        StreamResetOutgoingParam,
+        StreamResetResponseParam,
+        StreamAddOutgoingParam,
+    )
 }
 
 
@@ -550,14 +560,15 @@ class InboundStream:
             self.reassembly.append(chunk)
             return
 
-        for i, rchunk in enumerate(self.reassembly):
-            # should never happen, the chunk should have been eliminated
-            # as a duplicate when _mark_received() is called
+        for i in range(len(self.reassembly) - 1, -1, -1):
+            rchunk = self.reassembly[i]
             assert rchunk.tsn != chunk.tsn, "duplicate chunk in reassembly"
 
-            if uint32_gt(rchunk.tsn, chunk.tsn):
-                self.reassembly.insert(i, chunk)
-                break
+            if uint32_gt(chunk.tsn, rchunk.tsn):
+                self.reassembly.insert(i + 1, chunk)
+                return
+
+        self.reassembly.insert(0, chunk)
 
     def pop_messages(self) -> Iterator[tuple[int, int, bytes]]:
         pos = 0
@@ -667,6 +678,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         # inbound
         self._advertised_rwnd = 1024 * 1024
         self._inbound_streams: dict[int, InboundStream] = {}
+        self._inbound_stream_last_delivered_tsn: dict[int, int] = {}
         self._inbound_streams_count = 0
         self._inbound_streams_max = MAX_STREAMS
         self._last_received_tsn: Optional[int] = None
@@ -679,6 +691,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._fast_recovery_exit = None
         self._fast_recovery_transmit = False
         self._forward_tsn_chunk: Optional[ForwardTsnChunk] = None
+        self._forward_tsn_streams: dict[int, int] = {}
         self._flight_size = 0
         self._local_tsn = random32()
         self._last_sacked_tsn = tsn_minus_one(self._local_tsn)
@@ -694,6 +707,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._reconfig_request: Optional[StreamResetOutgoingParam] = None
         self._reconfig_request_seq = self._local_tsn
         self._reconfig_response_seq = 0
+        self._reconfig_reset_pending: Optional[StreamResetOutgoingParam] = None
 
         # rtt calculation
         self._srtt: Optional[float] = None
@@ -899,6 +913,20 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         for chunk in chunks:
             await self._receive_chunk(chunk)
 
+        # Delivery markers only protect skips while a receive gap remains.
+        self._inbound_stream_last_delivered_tsn = {
+            stream_id: tsn
+            for stream_id, tsn in self._inbound_stream_last_delivered_tsn.items()
+            if uint32_gt(tsn, self._last_received_tsn)
+        }
+
+        if self._reconfig_reset_pending is not None and uint32_gte(
+            self._last_received_tsn, self._reconfig_reset_pending.last_tsn
+        ):
+            param = self._reconfig_reset_pending
+            self._reconfig_reset_pending = None
+            await self._receive_reconfig_param(param)
+
         # send SACK if needed
         if self._sack_needed:
             await self._send_sack()
@@ -920,19 +948,19 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if not abandon:
             return False
 
-        chunk_pos = self._sent_queue.index(chunk)
-        for pos in range(chunk_pos, -1, -1):
-            ochunk = self._sent_queue[pos]
+        chunks = [*self._sent_queue, *self._outbound_queue]
+        first_pos = last_pos = chunks.index(chunk)
+        while first_pos > 0 and not (chunks[first_pos].flags & SCTP_DATA_FIRST_FRAG):
+            first_pos -= 1
+        while last_pos < len(chunks) - 1 and not (
+            chunks[last_pos].flags & SCTP_DATA_LAST_FRAG
+        ):
+            last_pos += 1
+        for ochunk in chunks[first_pos : last_pos + 1]:
+            if ochunk._sent_count and not ochunk._acked and not ochunk._retransmit:
+                self._flight_size_decrease(ochunk)
             ochunk._abandoned = True
             ochunk._retransmit = False
-            if ochunk.flags & SCTP_DATA_FIRST_FRAG:
-                break
-        for pos in range(chunk_pos, len(self._sent_queue)):
-            ochunk = self._sent_queue[pos]
-            ochunk._abandoned = True
-            ochunk._retransmit = False
-            if ochunk.flags & SCTP_DATA_LAST_FRAG:
-                break
 
         return True
 
@@ -966,6 +994,19 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         Receive data stream -> ULP.
         """
         await self._data_channel_receive(stream_id, pp_id, data)
+
+    def _pop_inbound_messages(self, stream_id: int) -> list[tuple[int, int, bytes]]:
+        stream = self._inbound_streams[stream_id]
+        chunks = list(stream.reassembly)
+        messages = list(stream.pop_messages())
+        if messages:
+            remaining = {chunk.tsn for chunk in stream.reassembly}
+            for chunk in chunks:
+                if chunk.tsn not in remaining and not (
+                    chunk.flags & SCTP_DATA_UNORDERED
+                ):
+                    self._inbound_stream_last_delivered_tsn[stream_id] = chunk.tsn
+        return messages
 
     async def _receive_chunk(self, chunk: Chunk) -> None:
         """
@@ -1071,6 +1112,23 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             isinstance(chunk, InitAckChunk)
             and self._association_state == self.State.COOKIE_WAIT
         ):
+            for k, v in chunk.params:
+                if k == SCTP_STATE_COOKIE:
+                    echo = CookieEchoChunk(body=v)
+                    break
+            else:
+                self._remote_verification_tag = chunk.initiate_tag
+                abort = AbortChunk()
+                abort.params.append(
+                    (SCTP_CAUSE_MISSING_PARAM, pack("!LH", 1, SCTP_STATE_COOKIE))
+                )
+                self._set_state(self.State.CLOSED)
+                try:
+                    await self._send_chunk(abort)
+                except ConnectionError:
+                    pass
+                return
+
             # cancel T1 timer and process chunk
             self._t1_cancel()
             self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
@@ -1091,11 +1149,6 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 self._outbound_streams_count, chunk.inbound_streams
             )
 
-            echo = CookieEchoChunk()
-            for k, v in chunk.params:
-                if k == SCTP_STATE_COOKIE:
-                    echo.body = v
-                    break
             await self._send_chunk(echo)
 
             # start T1 timer and enter COOKIE-ECHOED state
@@ -1121,6 +1174,12 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Handle a DATA chunk.
         """
+        # Serial ordering is undefined at exactly half the TSN range (RFC 1982).
+        if (
+            chunk.tsn - self._last_received_tsn
+        ) % SCTP_TSN_MODULO == SCTP_TSN_MODULO // 2:
+            return
+
         self._sack_needed = True
 
         # mark as received
@@ -1133,7 +1192,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         # defragment data
         inbound_stream.add_chunk(chunk)
         self._advertised_rwnd -= len(chunk.user_data)
-        for message in inbound_stream.pop_messages():
+        for message in self._pop_inbound_messages(chunk.stream_id):
             self._advertised_rwnd += len(message[2])
             await self._receive(*message)
 
@@ -1165,11 +1224,17 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         # update reassembly
         for stream_id, stream_seq in chunk.streams:
+            # Retained skips can outlive half of the 16-bit SSN space.
+            last_delivered_tsn = self._inbound_stream_last_delivered_tsn.get(stream_id)
+            if last_delivered_tsn is not None and uint32_gte(
+                last_delivered_tsn, chunk.cumulative_tsn
+            ):
+                continue
             inbound_stream = self._get_inbound_stream(stream_id)
 
             # advance sequence number and perform delivery
             inbound_stream.sequence_number = uint16_add(stream_seq, 1)
-            for message in inbound_stream.pop_messages():
+            for message in self._pop_inbound_messages(stream_id):
                 self._advertised_rwnd += len(message[2])
                 await self._receive(*message)
 
@@ -1198,7 +1263,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ):
             schunk = self._sent_queue.popleft()
             done += 1
-            if not schunk._acked:
+            if not schunk._acked and not schunk._abandoned:
                 done_bytes += schunk._book_size
                 self._flight_size_decrease(schunk)
 
@@ -1221,24 +1286,25 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 if uint32_gt(schunk.tsn, highest_seen_tsn):
                     break
                 if schunk.tsn in seen and not schunk._acked:
-                    done_bytes += schunk._book_size
                     schunk._acked = True
-                    self._flight_size_decrease(schunk)
+                    if not schunk._abandoned:
+                        done_bytes += schunk._book_size
+                        self._flight_size_decrease(schunk)
                     highest_newly_acked = schunk.tsn
 
             # strike missing chunks prior to HTNA
             for schunk in self._sent_queue:
                 if uint32_gt(schunk.tsn, highest_newly_acked):
                     break
-                if schunk.tsn not in seen:
+                if schunk.tsn not in seen and not schunk._abandoned:
                     schunk._misses += 1
                     if schunk._misses == 3:
                         schunk._misses = 0
                         if not self._maybe_abandon(schunk):
                             schunk._retransmit = True
+                            self._flight_size_decrease(schunk)
 
                         schunk._acked = False
-                        self._flight_size_decrease(schunk)
 
                         loss = True
 
@@ -1263,14 +1329,14 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         elif uint32_gte(chunk.cumulative_tsn, self._fast_recovery_exit):
             self._fast_recovery_exit = None
 
-        if not self._sent_queue:
-            # there is no outstanding data, stop T3
+        self._update_advanced_peer_ack_point()
+
+        if not self._sent_queue and self._forward_tsn_chunk is None:
             self._t3_cancel()
         elif done:
             # the earliest outstanding chunk was acknowledged, restart T3
             self._t3_restart()
 
-        self._update_advanced_peer_ack_point()
         await self._data_channel_flush()
         await self._transmit()
 
@@ -1286,9 +1352,19 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self.__log_debug("<< %s", param)
 
         if isinstance(param, StreamResetOutgoingParam):
+            if uint32_gt(param.last_tsn, self._last_received_tsn):
+                self._reconfig_reset_pending = param
+                await self._send_reconfig_param(
+                    StreamResetResponseParam(
+                        response_sequence=param.request_sequence, result=6
+                    )
+                )
+                return
+
             # mark closed inbound streams
             for stream_id in param.streams:
                 self._inbound_streams.pop(stream_id, None)
+                self._inbound_stream_last_delivered_tsn.pop(stream_id, None)
 
                 # close data channel
                 channel = self._data_channels.get(stream_id)
@@ -1313,17 +1389,31 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._reconfig_response_seq = param.request_sequence
 
             await self._send_reconfig_param(response_param)
-        elif isinstance(param, StreamResetResponseParam):
+        else:
             if (
                 self._reconfig_request
                 and param.response_sequence == self._reconfig_request.request_sequence
+                and param.result in (0, 1)
             ):
-                # mark closed streams
-                for stream_id in self._reconfig_request.streams:
+                request = self._reconfig_request
+                self._reconfig_request = None
+                for stream_id in request.streams:
                     self._outbound_stream_seq.pop(stream_id, None)
+                    self._forward_tsn_streams.pop(stream_id, None)
+                if self._forward_tsn_chunk is not None:
+                    self._forward_tsn_chunk.streams = list(
+                        self._forward_tsn_streams.items()
+                    )
+
+                # RFC 6525 requires the peer to consume last_tsn before success.
+                # Retire that data too, so a lost SACK cannot revive old skips.
+                sack = SackChunk()
+                sack.cumulative_tsn = request.last_tsn
+                await self._receive_sack_chunk(sack)
+
+                for stream_id in request.streams:
                     self._data_channel_closed(stream_id)
 
-                self._reconfig_request = None
                 await self._transmit_reconfig()
 
     async def _send(
@@ -1403,11 +1493,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ],
     ) -> None:
         chunk = ReconfigChunk()
-        for k, cls in RECONFIG_PARAM_TYPES.items():
-            if isinstance(param, cls):
-                param_type = k
-                break
-        chunk.params.append((param_type, bytes(param)))
+        chunk.params.append((param.type, bytes(param)))
 
         self.__log_debug(">> %s", param)
         await self._send_chunk(chunk)
@@ -1633,23 +1719,33 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Try to advance "Advanced.Peer.Ack.Point" according to RFC 3758.
         """
-        if uint32_gt(self._last_sacked_tsn, self._advanced_peer_ack_tsn):
+        if uint32_gte(self._last_sacked_tsn, self._advanced_peer_ack_tsn):
             self._advanced_peer_ack_tsn = self._last_sacked_tsn
+            self._forward_tsn_streams.clear()
+            self._forward_tsn_chunk = None
 
-        done = 0
-        streams = {}
+        # Retain reserved TSNs until FORWARD TSN can advance past them.
+        while self._outbound_queue and self._outbound_queue[0]._abandoned:
+            self._sent_queue.append(self._outbound_queue.popleft())
+
         while self._sent_queue and self._sent_queue[0]._abandoned:
+            # Retained skips cannot cross an unacknowledged reset boundary.
+            if (
+                self._reconfig_request is not None
+                and uint32_gt(self._reconfig_request.last_tsn, self._last_sacked_tsn)
+                and uint32_gt(self._sent_queue[0].tsn, self._reconfig_request.last_tsn)
+            ):
+                break
             chunk = self._sent_queue.popleft()
             self._advanced_peer_ack_tsn = chunk.tsn
-            done += 1
             if not (chunk.flags & SCTP_DATA_UNORDERED):
-                streams[chunk.stream_id] = chunk.stream_seq
+                self._forward_tsn_streams[chunk.stream_id] = chunk.stream_seq
 
-        if done:
+        if uint32_gt(self._advanced_peer_ack_tsn, self._last_sacked_tsn):
             # build FORWARD TSN
             self._forward_tsn_chunk = ForwardTsnChunk()
             self._forward_tsn_chunk.cumulative_tsn = self._advanced_peer_ack_tsn
-            self._forward_tsn_chunk.streams = list(streams.items())
+            self._forward_tsn_chunk.streams = list(self._forward_tsn_streams.items())
 
     def _update_rto(self, R: float) -> None:
         """

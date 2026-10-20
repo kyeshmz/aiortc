@@ -80,11 +80,16 @@ some of its features:
 - Data Channels
 - Sending and receiving audio (Opus / PCMU / PCMA)
 - Sending and receiving video (VP8 / H.264)
+- H.265 / HEVC support in this fork, with a software encoder and decoder
 - Bundling audio / video / data channels
 - RTCP reports, including NACK / PLI to recover from packet loss
 
 Installing
 ----------
+
+For this fork's HEVC installation, codec selection, and limitations, see
+`Use H.265 / HEVC <docs/hevc.rst>`_. The PyPI release described below does not
+include this fork's changes.
 
 The easiest way to install ``aiortc`` is to run:
 

@@ -76,6 +76,48 @@ class AimdRateControlTest(TestCase):
         self.assertEqual(self.rate_control.avg_max_bitrate_kbps, None)
         self.assertEqual(self.rate_control.var_max_bitrate_kbps, 0.4)
 
+    def test_update_timing_and_clamp_sequence(self) -> None:
+        self.rate_control.set_estimate(300000, 0)
+        for usage, throughput, now_ms, expected in (
+            (BandwidthUsage.NORMAL, 300000, 0, 301000),
+            (BandwidthUsage.NORMAL, 300000, 1, 302000),
+            (BandwidthUsage.NORMAL, 300000, 501, 313847),
+            (BandwidthUsage.NORMAL, 300000, 1500, 338928),
+            (BandwidthUsage.NORMAL, 300000, 2500, 366042),
+            (BandwidthUsage.NORMAL, 300000, 3501, 395325),
+            (BandwidthUsage.NORMAL, 300000, 13501, 426951),
+            (BandwidthUsage.NORMAL, 300000, 13500, 427951),
+            (BandwidthUsage.NORMAL, 10000, 14500, 427951),
+            (BandwidthUsage.OVERUSING, None, 14600, 8500),
+            (BandwidthUsage.UNDERUSING, None, 14700, 8500),
+            (BandwidthUsage.NORMAL, None, 14800, 8500),
+        ):
+            with self.subTest(usage=usage, throughput=throughput, now_ms=now_ms):
+                self.assertEqual(
+                    self.rate_control.update(usage, throughput, now_ms), expected
+                )
+
+    def test_update_initialization_and_hold_sequence(self) -> None:
+        for usage, throughput, now_ms, expected in (
+            (BandwidthUsage.NORMAL, None, 0, None),
+            (BandwidthUsage.UNDERUSING, 300000, 100, None),
+            (BandwidthUsage.NORMAL, 300000, 3100, None),
+            (BandwidthUsage.NORMAL, 300000, 3101, 301000),
+            (BandwidthUsage.NORMAL, None, 4101, 325080),
+            (BandwidthUsage.UNDERUSING, None, 4200, 325080),
+            (BandwidthUsage.NORMAL, None, 4300, 326080),
+            (BandwidthUsage.NORMAL, None, 4299, 327080),
+            (BandwidthUsage.OVERUSING, 200000, 4400, 170000),
+            (BandwidthUsage.UNDERUSING, None, 4500, 170000),
+            (BandwidthUsage.NORMAL, None, 4600, 170000),
+            (BandwidthUsage.NORMAL, None, 5600, 188888),
+            (BandwidthUsage.NORMAL, 500000, 6600, 203999),
+        ):
+            with self.subTest(usage=usage, throughput=throughput, now_ms=now_ms):
+                self.assertEqual(
+                    self.rate_control.update(usage, throughput, now_ms), expected
+                )
+
     def test_additive_rate_increase(self) -> None:
         acked_bitrate = 100000
         self.rate_control.set_estimate(acked_bitrate, 0)
@@ -950,6 +992,38 @@ class Stream:
 
 
 class RemoteBitrateEstimatorTest(TestCase):
+    def test_periodic_feedback_and_early_overuse_feedback(self) -> None:
+        estimator = RemoteBitrateEstimator()
+        stream = Stream(capacity=500000)
+        updates = []
+        for send_time, arrival_time, size in stream.generate_frames(130):
+            result = estimator.add(arrival_time, send_time, size, 1234)
+            if result is not None:
+                updates.append((arrival_time, result))
+        self.assertEqual(
+            updates,
+            [
+                (3090, (361000, [1234])),
+                (3623, (376116, [1234])),
+                (4157, (391895, [1234])),
+            ],
+        )
+
+        stream.capacity = 250000
+        overuse_updates = []
+        for send_time, arrival_time, size in stream.generate_frames(4):
+            result = estimator.add(arrival_time, send_time, size, 5678)
+            overuse_updates.append((arrival_time, result))
+        self.assertEqual(
+            overuse_updates,
+            [
+                (4381, None),
+                (4429, None),
+                (4477, (295800, [1234, 5678])),
+                (4525, (285600, [1234, 5678])),
+            ],
+        )
+
     def test_capacity_drop(self) -> None:
         estimator = RemoteBitrateEstimator()
         stream = Stream(capacity=500000)

@@ -16,7 +16,9 @@ class JitterBuffer:
     def __init__(
         self, capacity: int, prefetch: int = 0, is_video: bool = False
     ) -> None:
-        assert capacity & (capacity - 1) == 0, "capacity must be a power of 2"
+        assert capacity > 0 and capacity & (capacity - 1) == 0, (
+            "capacity must be a power of 2"
+        )
         self._capacity = capacity
         self._origin: Optional[int] = None
         self._packets: list[Optional[RtpPacket]] = [None for i in range(capacity)]
@@ -110,15 +112,13 @@ class JitterBuffer:
         to prevent sending corrupted frames to the decoder.
         """
         timestamp = None
-        for i in range(self._capacity):
-            pos = self._origin % self._capacity
-            packet = self._packets[pos]
+        for index in range(self._capacity):
+            position = self._origin % self._capacity
+            packet = self._packets[position]
             if packet is not None:
-                if i >= count and timestamp != packet.timestamp:
-                    break
+                if index >= count and timestamp != packet.timestamp:
+                    return False
                 timestamp = packet.timestamp
-            self._packets[pos] = None
+            self._packets[position] = None
             self._origin = uint16_add(self._origin, 1)
-            if i == self._capacity - 1:
-                return True
-        return False
+        return True

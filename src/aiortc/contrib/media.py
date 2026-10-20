@@ -240,7 +240,7 @@ class PlayerStreamTrack(MediaStreamTrack):
             raise MediaStreamError
         if isinstance(data, Frame):
             data_time = data.time
-        elif isinstance(data, Packet):
+        else:
             data_time = float(data.pts * data.time_base)
 
         # control playback rate
@@ -335,7 +335,7 @@ class MediaPlayer:
                 if self.__decode:
                     self.__video = PlayerStreamTrack(self, kind="video")
                     self.__streams.append(stream)
-                elif stream.codec_context.name in ["h264", "vp8"]:
+                elif stream.codec_context.name in ["h264", "hevc", "vp8"]:
                     self.__video = PlayerStreamTrack(self, kind="video")
                     self.__streams.append(stream)
 
