@@ -556,15 +556,14 @@ class RemoteBitrateEstimator:
                 arrival_time_ms,
             )
 
-        if not update_estimate:
-            if (
-                self.last_update_ms is None
-                or (arrival_time_ms - self.last_update_ms)
-                > self.rate_control.feedback_interval()
-            ):
-                update_estimate = True
-            elif self.detector.state() == BandwidthUsage.OVERUSING:
-                update_estimate = True
+        if (
+            self.last_update_ms is None
+            or (arrival_time_ms - self.last_update_ms)
+            > self.rate_control.feedback_interval()
+        ):
+            update_estimate = True
+        elif self.detector.state() == BandwidthUsage.OVERUSING:
+            update_estimate = True
 
         if update_estimate:
             target_bitrate = self.rate_control.update(

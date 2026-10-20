@@ -573,8 +573,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             for receiver in self._rtp_router.receivers:
                 receiver._handle_disconnect()
         except Exception as exc:
-            if not isinstance(exc, asyncio.CancelledError):
-                self.__log_warning(traceback.format_exc())
+            self.__log_warning(traceback.format_exc())
             raise exc
         finally:
             self._set_state(State.CLOSED)
