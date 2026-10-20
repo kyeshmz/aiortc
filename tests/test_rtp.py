@@ -185,6 +185,58 @@ class RtcpPacketTest(TestCase):
             RtcpPacket.parse(data)
         self.assertEqual(str(cm.exception), "RTCP SDES item is truncated")
 
+    def test_sdes_requires_end_item(self) -> None:
+        for data in (
+            bytes.fromhex("81ca000100000001"),
+            bytes.fromhex("81ca00020000000101026162"),
+            bytes.fromhex("a1ca0003000000010103616263000003"),
+        ):
+            with self.subTest(data=data):
+                with self.assertRaises(ValueError):
+                    RtcpPacket.parse(data)
+                valid = bytes.fromhex("81ca00020000000101016100")
+                self.assertEqual(
+                    RtcpPacket.parse(valid),
+                    [
+                        RtcpSdesPacket(
+                            chunks=[rtp.RtcpSourceInfo(ssrc=1, items=[(1, b"a")])]
+                        )
+                    ],
+                )
+
+    def test_sdes_item_without_length_is_truncated(self) -> None:
+        data = bytes.fromhex("a1ca00020000000101000003")
+        with self.assertRaises(ValueError):
+            RtcpPacket.parse(data)
+
+    def test_sdes_end_has_no_length_and_aligns_next_source(self) -> None:
+        data = bytes.fromhex("82ca00050000000101036162630000000000000201017a00")
+        self.assertEqual(
+            RtcpPacket.parse(data),
+            [
+                RtcpSdesPacket(
+                    chunks=[
+                        rtp.RtcpSourceInfo(ssrc=1, items=[(1, b"abc")]),
+                        rtp.RtcpSourceInfo(ssrc=2, items=[(1, b"z")]),
+                    ]
+                )
+            ],
+        )
+
+    def test_sdes_empty_source_before_single_byte_end(self) -> None:
+        data = bytes.fromhex("82ca000400000001000000000000000201017a00")
+        self.assertEqual(
+            RtcpPacket.parse(data),
+            [
+                RtcpSdesPacket(
+                    chunks=[
+                        rtp.RtcpSourceInfo(ssrc=1, items=[]),
+                        rtp.RtcpSourceInfo(ssrc=2, items=[(1, b"z")]),
+                    ]
+                )
+            ],
+        )
+
     def test_sdes_source_truncated(self) -> None:
         data = load("rtcp_sdes_source_truncated.bin")
 

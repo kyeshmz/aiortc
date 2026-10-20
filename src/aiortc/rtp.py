@@ -539,18 +539,25 @@ class RtcpSdesPacket:
             pos += 4
 
             items = []
-            while pos < len(data) - 1:
-                d_type, d_length = unpack_from("!BB", data, pos)
-                pos += 2
+            while pos < len(data):
+                d_type = data[pos]
+                pos += 1
+                if d_type == 0:
+                    pos = (pos + 3) & ~3
+                    break
+
+                if pos >= len(data):
+                    raise ValueError("RTCP SDES item is truncated")
+                d_length = data[pos]
+                pos += 1
 
                 if len(data) < pos + d_length:
                     raise ValueError("RTCP SDES item is truncated")
                 d_value = data[pos : pos + d_length]
                 pos += d_length
-                if d_type == 0:
-                    break
-                else:
-                    items.append((d_type, d_value))
+                items.append((d_type, d_value))
+            else:
+                raise ValueError("RTCP SDES source has no END item")
             chunks.append(RtcpSourceInfo(ssrc=ssrc, items=items))
         return cls(chunks=chunks)
 
