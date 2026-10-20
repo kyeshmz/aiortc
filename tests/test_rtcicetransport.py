@@ -1,10 +1,8 @@
 import asyncio
 from collections.abc import Callable
-from typing import Optional
 
 import aioice.ice
 import aioice.stun
-from aioice import ConnectionClosed
 from aiortc.exceptions import InvalidStateError
 from aiortc.rtcconfiguration import RTCIceServer
 from aiortc.rtcicetransport import (
@@ -17,15 +15,6 @@ from aiortc.rtcicetransport import (
 )
 
 from .utils import TestCase, asynctest
-
-
-async def mock_connect() -> None:
-    pass
-
-
-async def mock_get_event() -> Optional[aioice.ice.ConnectionEvent]:
-    await asyncio.sleep(0.5)
-    return ConnectionClosed()
 
 
 class ConnectionKwargsTest(TestCase):
@@ -451,21 +440,86 @@ class RTCIceTransportTest(TestCase):
         self.assertEqual(str(cm.exception), "RTCIceTransport is closed")
 
     @asynctest
-    async def test_connection_closed(self) -> None:
-        gatherer = RTCIceGatherer()
-
-        # mock out methods
-        gatherer._connection.connect = mock_connect  # type: ignore
-        gatherer._connection.get_event = mock_get_event  # type: ignore
-
+    async def test_start_before_gathering_then_stop(self) -> None:
+        tasks = asyncio.all_tasks()
+        gatherer = RTCIceGatherer(iceServers=[])
         transport = RTCIceTransport(gatherer)
-        self.assertEqual(transport.state, "new")
+        states = []
+        transport.on("statechange", lambda: states.append(transport.state))
 
-        await transport.start(RTCIceParameters(usernameFragment="foo", password="bar"))
-        self.assertEqual(transport.state, "completed")
-
-        await asyncio.sleep(1)
+        await transport.start(
+            RTCIceParameters(
+                usernameFragment="remote-username",
+                password="abcdefghijklmnopqrstuv",
+            )
+        )
+        self.assertEqual(gatherer.state, "new")
         self.assertEqual(transport.state, "failed")
+        self.assertEqual(states, ["checking", "failed"])
 
         await transport.stop()
         self.assertEqual(transport.state, "closed")
+        self.assertEqual(states, ["checking", "failed", "closed"])
+        await asyncio.sleep(0)
+        self.assertEqual(asyncio.all_tasks(), tasks)
+
+    @asynctest
+    async def test_monitor_connection_already_closed(self) -> None:
+        tasks = asyncio.all_tasks()
+        transport = RTCIceTransport(RTCIceGatherer(iceServers=[]))
+        await transport._connection.close()
+        self.assertIsNone(await transport._connection.get_event())
+
+        await transport._monitor()
+        self.assertEqual(transport.state, "new")
+
+        await transport.stop()
+        self.assertEqual(transport.state, "closed")
+        self.assertEqual(asyncio.all_tasks(), tasks)
+
+    @asynctest
+    async def test_connection_closed(self) -> None:
+        tasks = asyncio.all_tasks()
+        gatherer_1 = RTCIceGatherer(iceServers=[])
+        gatherer_2 = RTCIceGatherer(iceServers=[])
+        transport_1 = RTCIceTransport(gatherer_1)
+        transport_2 = RTCIceTransport(gatherer_2)
+        states = []
+        failed = asyncio.Event()
+
+        def state_changed() -> None:
+            states.append(transport_1.state)
+            if transport_1.state == "failed":
+                failed.set()
+
+        transport_1.on("statechange", state_changed)
+        try:
+            await asyncio.gather(gatherer_1.gather(), gatherer_2.gather())
+            for candidate in gatherer_2.getLocalCandidates():
+                await transport_1.addRemoteCandidate(candidate)
+            for candidate in gatherer_1.getLocalCandidates():
+                await transport_2.addRemoteCandidate(candidate)
+            await asyncio.gather(
+                transport_1.start(gatherer_2.getLocalParameters()),
+                transport_2.start(gatherer_1.getLocalParameters()),
+            )
+            self.assertEqual(transport_1.state, "completed")
+            self.assertEqual(transport_2.state, "completed")
+
+            transport_1._connection._emit_event(aioice.ice.ConnectionEvent())
+            await asyncio.sleep(0.01)
+            self.assertEqual(transport_1.state, "completed")
+            self.assertEqual(states, ["checking", "completed"])
+
+            await transport_1._connection.close()
+            await asyncio.wait_for(failed.wait(), timeout=1)
+            self.assertEqual(transport_1.state, "failed")
+            self.assertEqual(states, ["checking", "completed", "failed"])
+        finally:
+            await asyncio.gather(transport_1.stop(), transport_2.stop())
+
+        self.assertEqual(transport_1.state, "closed")
+        self.assertEqual(transport_2.state, "closed")
+        self.assertEqual(states, ["checking", "completed", "failed", "closed"])
+        await asyncio.sleep(0)
+        self.assertEqual(asyncio.all_tasks(), tasks)
