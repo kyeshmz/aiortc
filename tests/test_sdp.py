@@ -23,6 +23,46 @@ from .utils import lf2crlf
 class SdpTest(TestCase):
     maxDiff = None
 
+    def test_ignored_media_fields_and_empty_groups(self) -> None:
+        description = SessionDescription.parse(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+            "a=group:\r\na=msid-semantic:\r\n"
+            "m=audio 9 RTP/AVP 0\r\nb=AS:128\r\n"
+            "a=rtpmap:0 PCMU/8000\r\na=ssrc:1 cname:sender\r\n"
+            "a=ssrc:1 unknown:value\r\n"
+        )
+        self.assertEqual(description.group, [])
+        self.assertEqual(description.msid_semantic, [])
+        self.assertEqual(
+            description.media[0].ssrc, [SsrcDescription(ssrc=1, cname="sender")]
+        )
+        self.assertEqual(
+            description.media[0].rtp.codecs,
+            [
+                RTCRtpCodecParameters(
+                    mimeType="audio/PCMU", clockRate=8000, channels=1, payloadType=0
+                )
+            ],
+        )
+        self.assertNotIn("unknown:value", str(description))
+
+    def test_track_id_requires_matching_msid_semantic(self) -> None:
+        for groups, expected in (
+            ([], None),
+            (["LS stream"], None),
+            (["WMS other"], None),
+            (["LS stream", "WMS stream"], "track"),
+        ):
+            with self.subTest(groups=groups):
+                description = SessionDescription.parse(
+                    "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+                    + "".join(f"a=msid-semantic:{group}\r\n" for group in groups)
+                    + "m=audio 9 RTP/AVP 0\r\na=msid:stream track\r\n"
+                )
+                self.assertEqual(
+                    description.webrtc_track_id(description.media[0]), expected
+                )
+
     def test_audio_chrome(self) -> None:
         d = SessionDescription.parse(
             lf2crlf(

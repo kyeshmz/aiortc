@@ -121,6 +121,12 @@ async def wait_for_outcome(client: RTCSctpTransport, server: RTCSctpTransport) -
 
 
 class SctpPacketTest(TestCase):
+    def test_unknown_chunk_is_ignored(self) -> None:
+        unknown = Chunk(body=b"extension")
+        unknown.type = 255
+        packet = serialize_packet(5000, 5001, 1234, unknown)
+        self.assertEqual(parse_packet(packet), (5000, 5001, 1234, []))
+
     def roundtrip_packet(self, data: bytes, cls: type[T]) -> T:
         source_port, destination_port, verification_tag, chunks = parse_packet(data)
         self.assertEqual(source_port, 5000)

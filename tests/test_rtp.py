@@ -50,6 +50,16 @@ def create_audio_frame(
 
 
 class RtcpPacketTest(TestCase):
+    def test_unsupported_packet_in_compound_packet(self) -> None:
+        data = b"\x80\xcc\x00\x02\x00\x00\x00\x01TEST\x80\xc9\x00\x01\x00\x00\x00\x02"
+        self.assertEqual(RtcpPacket.parse(data), [RtcpRrPacket(ssrc=2)])
+
+    def test_rtpfb_without_lost_packets(self) -> None:
+        data = b"\x81\xcd\x00\x02\x00\x00\x00\x01\x00\x00\x00\x02"
+        packet = RtcpRtpfbPacket(fmt=1, ssrc=1, media_ssrc=2)
+        self.assertEqual(bytes(packet), data)
+        self.assertEqual(RtcpPacket.parse(data), [packet])
+
     def test_bye(self) -> None:
         data = load("rtcp_bye.bin")
         packets = RtcpPacket.parse(data)
@@ -416,6 +426,27 @@ class RtpPacketTest(TestCase):
 
 
 class RtpUtilTest(TestCase):
+    def test_unknown_header_extension(self) -> None:
+        extensions_map = rtp.HeaderExtensionsMap()
+        extensions_map.configure(
+            RTCRtpParameters(
+                headerExtensions=[
+                    RTCRtpHeaderExtensionParameters(id=1, uri="urn:example:unknown"),
+                    RTCRtpHeaderExtensionParameters(
+                        id=2, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(
+            extensions_map.get(0xBEDE, b"\x10x\x20v"),
+            rtp.HeaderExtensions(mid="v"),
+        )
+        self.assertEqual(
+            extensions_map.set(rtp.HeaderExtensions(mid="v", audio_level=(True, 5))),
+            (0xBEDE, b"\x20v\x00\x00"),
+        )
+
     def test_clamp_packets_lost(self) -> None:
         self.assertEqual(clamp_packets_lost(-8388609), -8388608)
         self.assertEqual(clamp_packets_lost(-8388608), -8388608)
