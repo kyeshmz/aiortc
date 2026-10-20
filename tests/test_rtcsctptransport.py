@@ -674,6 +674,158 @@ class SctpUtilTest(TestCase):
 
 class RTCSctpTransportTest(TestCase):
     @asynctest
+    async def test_init_ack_without_cookie_cancels_init_before_abort_send(self) -> None:
+        async with client_standalone() as client:
+            channel = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+
+            async def send_data(data: bytes) -> None:
+                if data[12] == 6:
+                    await asyncio.sleep(3.05)
+
+            with patch.object(
+                client.transport, "_send_data", side_effect=send_data
+            ) as send:
+                await client.start(client.getCapabilities(), 5000)
+                chunk = InitAckChunk()
+                chunk.initiate_tag = 0x01020304
+                await client._handle_data(
+                    serialize_packet(5000, 5000, client._local_verification_tag, chunk)
+                )
+                self.assertEqual(
+                    [call.args[0][12] for call in send.await_args_list], [1, 6]
+                )
+                self.assertEqual(
+                    send.await_args_list[1].args[0][:8],
+                    bytes.fromhex("1388138801020304"),
+                )
+                self.assertEqual(
+                    send.await_args_list[1].args[0][12:],
+                    bytes.fromhex("0600000e0002000a0000000100070000"),
+                )
+                self.assertEqual(client.state, "closed")
+                self.assertEqual(channel.readyState, "closed")
+                self.assertIsNone(client._t1_handle)
+
+    @asynctest
+    async def test_init_ack_without_cookie_closes_when_abort_send_fails(self) -> None:
+        async with client_standalone() as client:
+            channel = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            with patch.object(
+                client.transport, "_send_data", side_effect=[None, ConnectionError]
+            ) as send:
+                await client.start(client.getCapabilities(), 5000)
+                chunk = InitAckChunk()
+                chunk.initiate_tag = 0x01020304
+                await client._handle_data(
+                    serialize_packet(5000, 5000, client._local_verification_tag, chunk)
+                )
+                self.assertEqual(send.await_count, 2)
+                self.assertEqual(
+                    send.await_args.args[0][12:],
+                    bytes.fromhex("0600000e0002000a0000000100070000"),
+                )
+                self.assertEqual(client.state, "closed")
+                self.assertEqual(channel.readyState, "closed")
+                self.assertIsNone(client._t1_handle)
+
+    @asynctest
+    async def test_init_ack_without_cookie_closes_when_abort_send_cancelled(self) -> None:
+        async with client_standalone() as client:
+            channel = RTCDataChannel(
+                client, RTCDataChannelParameters(label="chat", negotiated=True, id=100)
+            )
+            started = asyncio.Event()
+
+            async def send_data(data: bytes) -> None:
+                if data[12] == 6:
+                    started.set()
+                    await asyncio.Event().wait()
+
+            with patch.object(client.transport, "_send_data", side_effect=send_data):
+                await client.start(client.getCapabilities(), 5000)
+                chunk = InitAckChunk()
+                chunk.initiate_tag = 0x01020304
+                task = asyncio.create_task(
+                    client._handle_data(
+                        serialize_packet(5000, 5000, client._local_verification_tag, chunk)
+                    )
+                )
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                self.assertEqual(client.state, "closed")
+                self.assertEqual(channel.readyState, "closed")
+                self.assertIsNone(client._t1_handle)
+
+    @asynctest
+    async def test_lost_forward_tsn_retransmits_until_acknowledged(self) -> None:
+        async with client_and_server() as (client, server):
+            client._local_tsn = 1
+            client._last_sacked_tsn = 0
+            client._advanced_peer_ack_tsn = 0
+            local = RTCDataChannel(
+                client,
+                RTCDataChannelParameters(
+                    label="partial", negotiated=True, id=100, maxRetransmits=0
+                ),
+            )
+            remote = RTCDataChannel(
+                server,
+                RTCDataChannelParameters(label="partial", negotiated=True, id=100),
+            )
+            received: asyncio.Queue[bytes] = asyncio.Queue()
+            remote.on("message", received.put_nowait)
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            with (
+                patch.object(
+                    client.transport, "_send_data", new_callable=AsyncMock
+                ) as tx,
+                patch.object(
+                    server.transport, "_send_data", new_callable=AsyncMock
+                ) as rx,
+            ):
+                local.send(b"M" * 4640)
+                await asyncio.sleep(0)
+                self.assertEqual(tx.await_count, 3)
+                for expiry in range(3):
+                    client._t3_cancel()
+                    client._t3_expired()
+                    await asyncio.sleep(0)
+                    self.assertEqual(tx.await_count, 4 + expiry)
+                    self.assertEqual(
+                        tx.await_args.args[0][12:],
+                        bytes.fromhex("c000000c0000000400640000"),
+                    )
+                    self.assertIsNotNone(client._t3_handle)
+                    self.assertEqual(client._flight_size, 0)
+                await server._handle_data(tx.await_args.args[0])
+                await client._handle_data(rx.await_args.args[0])
+                self.assertIsNone(client._t3_handle)
+                self.assertEqual(tx.await_count, 6)
+                local.send(b"after")
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    tx.await_args.args[0][12:],
+                    bytes.fromhex("00030015000000050064000100000035")
+                    + b"after\x00\x00\x00",
+                )
+                await server._handle_data(tx.await_args.args[0])
+                await client._handle_data(rx.await_args.args[0])
+                self.assertEqual(await asyncio.wait_for(received.get(), 1), b"after")
+                self.assertTrue(received.empty())
+                self.assertEqual(client._flight_size, 0)
+                self.assertIsNone(client._t3_handle)
+
+    @asynctest
     async def test_init_ack_without_cookie_aborts_association(self) -> None:
         for params in ([], [(0x8008, b"\x82")]):
             with self.subTest(params=params):
