@@ -335,7 +335,7 @@ class MediaPlayer:
                 if self.__decode:
                     self.__video = PlayerStreamTrack(self, kind="video")
                     self.__streams.append(stream)
-                elif stream.codec_context.name in ["h264", "vp8"]:
+                elif stream.codec_context.name in ["h264", "hevc", "vp8"]:
                     self.__video = PlayerStreamTrack(self, kind="video")
                     self.__streams.append(stream)
 

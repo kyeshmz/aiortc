@@ -110,6 +110,17 @@ class RTCRtpSenderTest(TestCase):
                         "profile-level-id": "42e01f",
                     },
                 ),
+                RTCRtpCodecCapability(
+                    mimeType="video/H265",
+                    clockRate=90000,
+                    parameters={
+                        "profile-id": "1",
+                        "tier-flag": "0",
+                        "level-id": "93",
+                        "tx-mode": "SRST",
+                        "sprop-max-don-diff": "0",
+                    },
+                ),
             ],
         )
         self.assertEqual(

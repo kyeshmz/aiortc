@@ -9,6 +9,7 @@ import av
 from av.frame import Frame
 from av.packet import Packet
 from av.video.codeccontext import VideoCodecContext
+from av.video.frame import PictureType
 
 from ..jitterbuffer import JitterFrame
 from ..mediastreams import VIDEO_TIME_BASE, convert_timebase
@@ -23,6 +24,13 @@ MAX_BITRATE = 3000000
 MAX_FRAME_RATE = 30
 PACKET_MAX = 1300
 DEFAULT_LEVEL = 93
+H265_PARAMETERS: ParametersDict = {
+    "profile-id": "1",
+    "tier-flag": "0",
+    "level-id": "93",
+    "tx-mode": "SRST",
+    "sprop-max-don-diff": "0",
+}
 
 NAL_TYPE_AP = 48
 NAL_TYPE_FU = 49
@@ -133,7 +141,9 @@ def h265_depayload(payload: bytes) -> bytes:
 
 class H265Decoder(Decoder):
     def __init__(self) -> None:
-        self.codec = av.CodecContext.create("hevc", "r")
+        codec = av.CodecContext.create("hevc", "r")
+        assert isinstance(codec, VideoCodecContext)
+        self.codec = codec
         self.codec.thread_count = 1
 
     def decode(self, encoded_frame: JitterFrame) -> list[Frame]:
@@ -182,7 +192,11 @@ class H265Encoder(Encoder):
             nal_type = _nal_type(unit)
             if nal_type >= NAL_TYPE_AP:
                 raise ValueError("HEVC packetizer requires NAL units")
-            if size + 2 + len(unit) > PACKET_MAX:
+            mixed_vcl_tid = any(
+                previous[1] != unit[1] and (nal_type < 32 or previous[0] >> 1 < 32)
+                for previous in pending
+            )
+            if size + 2 + len(unit) > PACKET_MAX or mixed_vcl_tid:
                 flush()
                 size = 2
             if len(unit) > PACKET_MAX:
@@ -228,13 +242,11 @@ class H265Encoder(Encoder):
         ):
             self.codec = None
 
-        frame.pict_type = (
-            av.video.frame.PictureType.I
-            if force_keyframe
-            else av.video.frame.PictureType.NONE
-        )
+        frame.pict_type = PictureType.I if force_keyframe else PictureType.NONE
         if self.codec is None:
-            self.codec = av.CodecContext.create("libx265", "w")
+            codec = av.CodecContext.create("libx265", "w")
+            assert isinstance(codec, VideoCodecContext)
+            self.codec = codec
             self.codec.width = frame.width
             self.codec.height = frame.height
             self.codec.bit_rate = self.target_bitrate
@@ -242,8 +254,8 @@ class H265Encoder(Encoder):
             self.codec.framerate = fractions.Fraction(MAX_FRAME_RATE, 1)
             self.codec.time_base = fractions.Fraction(1, MAX_FRAME_RATE)
             self.codec.thread_count = 1
+            self.codec.profile = "Main"
             self.codec.options = {
-                "profile": "main",
                 "preset": "veryfast",
                 "tune": "zerolatency",
                 "forced-idr": "1",
@@ -271,7 +283,7 @@ class H265Encoder(Encoder):
         timestamp = convert_timebase(packet.pts, time_base, VIDEO_TIME_BASE)
         if packet.stream is not None:
             bitstream_filter = av.BitStreamFilterContext(
-                "hevc_mp4toannexb", packet.stream
+                b"hevc_mp4toannexb", packet.stream
             )
             data = b"".join(bytes(p) for p in bitstream_filter.filter(packet))
         else:

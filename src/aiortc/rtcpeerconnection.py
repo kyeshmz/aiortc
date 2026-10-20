@@ -8,6 +8,7 @@ from pyee.asyncio import AsyncIOEventEmitter
 
 from . import clock, rtp, sdp
 from .codecs import CODECS, HEADER_EXTENSIONS, is_rtx
+from .codecs.h265 import negotiate_h265_parameters, parse_h265_parameters
 from .events import RTCTrackEvent
 from .exceptions import (
     InternalError,
@@ -61,9 +62,13 @@ def filter_preferred_codecs(
     filtered = []
     for pref in filter(lambda x: not is_rtx(x), preferred):
         for codec in codecs:
-            if (
-                codec.mimeType.lower() == pref.mimeType.lower()
-                and codec.parameters == pref.parameters
+            if codec.mimeType.lower() == pref.mimeType.lower() and (
+                codec.parameters == pref.parameters
+                or (
+                    codec.mimeType.lower() == "video/h265"
+                    and parse_h265_parameters(codec.parameters)
+                    <= parse_h265_parameters(pref.parameters)
+                )
             ):
                 filtered.append(codec)
 
@@ -99,6 +104,10 @@ def find_common_codecs(
         for codec in local_codecs:
             if is_codec_compatible(codec, c):
                 codec = copy.deepcopy(codec)
+                if codec.mimeType.lower() == "video/h265":
+                    codec.parameters = negotiate_h265_parameters(
+                        codec.parameters, c.parameters
+                    )
                 if c.payloadType in rtp.DYNAMIC_PAYLOAD_TYPES:
                     codec.payloadType = c.payloadType
                 codec.rtcpFeedback = list(
@@ -141,6 +150,13 @@ def is_codec_compatible(a: RTCRtpCodecParameters, b: RTCRtpCodecParameters) -> b
 
         try:
             return packetization(a) == packetization(b) and profile(a) == profile(b)
+        except ValueError:
+            return False
+
+    if a.mimeType.lower() == "video/h265":
+        try:
+            negotiate_h265_parameters(a.parameters, b.parameters)
+            return True
         except ValueError:
             return False
 

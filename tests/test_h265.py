@@ -2,15 +2,195 @@ import fractions
 from unittest import TestCase
 
 import av
+from aiortc.codecs import depayload, get_decoder, get_encoder
 from aiortc.codecs.h265 import (
     H265Decoder,
     H265Encoder,
     H265PayloadDescriptor,
     h265_depayload,
+    parse_h265_parameters,
 )
 from aiortc.jitterbuffer import JitterFrame
+from aiortc.rtcpeerconnection import (
+    filter_preferred_codecs,
+    find_common_codecs,
+    is_codec_compatible,
+)
+from aiortc.rtcrtpparameters import (
+    ParametersDict,
+    RTCRtpCodecCapability,
+    RTCRtpCodecParameters,
+)
+from aiortc.sdp import SessionDescription
 
 from .codecs import CodecTestCase
+
+H265_CODEC = RTCRtpCodecParameters(
+    mimeType="video/H265", clockRate=90000, payloadType=103
+)
+
+
+class H265NegotiationTest(TestCase):
+    def test_factories_and_depayload(self) -> None:
+        self.assertIsInstance(get_encoder(H265_CODEC), H265Encoder)
+        self.assertIsInstance(get_decoder(H265_CODEC), H265Decoder)
+        self.assertEqual(
+            depayload(H265_CODEC, b"\x40\x01a"), b"\x00\x00\x00\x01\x40\x01a"
+        )
+
+    def test_supported_parameters(self) -> None:
+        cases: list[tuple[ParametersDict, int]] = [
+            ({}, 93),
+            ({"profile-id": "1", "tier-flag": "0", "level-id": "93"}, 93),
+            ({"profile-id": 1, "tier-flag": 0, "level-id": 93}, 93),
+            ({"profile-space": "0", "tx-mode": "SRST", "sprop-max-don-diff": "0"}, 93),
+            (
+                {
+                    "profile-compatibility-indicator": "40000000",
+                    "interop-constraints": "B00000000000",
+                },
+                93,
+            ),
+        ]
+        for level in (30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186):
+            cases.append(({"level-id": str(level)}, level))
+        for parameters, expected in cases:
+            with self.subTest(parameters=parameters):
+                remote = RTCRtpCodecParameters(
+                    mimeType="video/h265",
+                    clockRate=90000,
+                    payloadType=110,
+                    parameters=parameters,
+                )
+                self.assertEqual(parse_h265_parameters(parameters), expected)
+                self.assertTrue(is_codec_compatible(H265_CODEC, remote))
+                common = find_common_codecs([H265_CODEC], [remote])
+                self.assertEqual(len(common), 1)
+                self.assertEqual(
+                    common[0].parameters, {"level-id": str(min(93, expected))}
+                )
+                self.assertEqual(common[0].payloadType, 110)
+                self.assertEqual(H265_CODEC.parameters, {})
+
+    def test_unsupported_parameters(self) -> None:
+        cases: list[ParametersDict] = [
+            {"profile-id": "2"},
+            {"profile-id": "-1"},
+            {"profile-id": "32"},
+            {"profile-space": "1"},
+            {"tier-flag": "1"},
+            {"tier-flag": "2"},
+            {"tx-mode": "MRST"},
+            {"tx-mode": "MRMT"},
+            {"tx-mode": "invalid"},
+            {"sprop-max-don-diff": "1"},
+            {"sprop-max-don-diff": "-1"},
+            {"sprop-max-don-diff": "invalid"},
+            {"sprop-depack-buf-nalus": "1"},
+            {"sprop-vps": "QAEMAf//"},
+            {"sprop-sps": "QgE="},
+            {"sprop-pps": "RAE="},
+            {"recv-sub-layer-id": "0"},
+            {"sprop-sub-layer-id": "0"},
+            {"max-recv-level-id": "120"},
+            {"max-fps": "1500"},
+            {"level-id": "0"},
+            {"level-id": "31"},
+            {"level-id": "256"},
+            {"level-id": "-1"},
+            {"level-id": "3.1"},
+            {"level-id": "1e2"},
+            {"level-id": "invalid"},
+            {"level-id": " 93"},
+            {"level-id": None},
+            {"interop-constraints": "000000000000"},
+            {"interop-constraints": "b00000000001"},
+            {"profile-compatibility-indicator": "60000000"},
+            {"packetization-mode": "1"},
+        ]
+        for parameters in cases:
+            remote = RTCRtpCodecParameters(
+                mimeType="video/H265",
+                clockRate=90000,
+                payloadType=110,
+                parameters=parameters,
+            )
+            rtx = RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=111,
+                parameters={"apt": 110},
+            )
+            with self.subTest(parameters=parameters):
+                self.assertFalse(is_codec_compatible(H265_CODEC, remote))
+                self.assertFalse(is_codec_compatible(remote, H265_CODEC))
+                self.assertEqual(find_common_codecs([H265_CODEC], [remote, rtx]), [])
+                with self.assertRaises(ValueError):
+                    get_encoder(remote)
+                with self.assertRaises(ValueError):
+                    get_decoder(remote)
+
+    def test_lower_level_preferences_and_rtx(self) -> None:
+        remote = RTCRtpCodecParameters(
+            mimeType="video/H265",
+            clockRate=90000,
+            payloadType=110,
+            parameters={"level-id": "60"},
+        )
+        rtx = RTCRtpCodecParameters(
+            mimeType="video/rtx",
+            clockRate=90000,
+            payloadType=111,
+            parameters={"apt": 110},
+        )
+        common = find_common_codecs([H265_CODEC], [remote, rtx])
+        preferred = [
+            RTCRtpCodecCapability(
+                mimeType="video/H265", clockRate=90000, parameters={"level-id": "93"}
+            ),
+            RTCRtpCodecCapability(mimeType="video/rtx", clockRate=90000),
+        ]
+        filtered = filter_preferred_codecs(common, preferred)
+        self.assertEqual(filtered, [remote, rtx])
+        encoder = get_encoder(filtered[0])
+        assert isinstance(encoder, H265Encoder)
+        self.assertEqual(encoder.level_id, 60)
+        self.assertEqual(encoder.target_bitrate, 1000000)
+        rtx.parameters["apt"] = 109
+        self.assertEqual(find_common_codecs([H265_CODEC], [remote, rtx]), [remote])
+        rtx.parameters["apt"] = 110
+        rtx.clockRate = 8000
+        self.assertEqual(find_common_codecs([H265_CODEC], [remote, rtx]), [remote])
+
+    def test_sdp_parameters_roundtrip(self) -> None:
+        sdp = (
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+            "m=video 9 UDP/TLS/RTP/SAVPF 110 111\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=rtpmap:110 H265/90000\r\n"
+            "a=fmtp:110 profile-id=1;tier-flag=0;level-id=60;"
+            "tx-mode=SRST;sprop-max-don-diff=0\r\n"
+            "a=rtpmap:111 rtx/90000\r\na=fmtp:111 apt=110\r\n"
+        )
+        parsed = SessionDescription.parse(sdp)
+        codec, rtx = parsed.media[0].rtp.codecs
+        self.assertEqual(
+            codec.parameters,
+            {
+                "profile-id": "1",
+                "tier-flag": "0",
+                "level-id": "60",
+                "tx-mode": "SRST",
+                "sprop-max-don-diff": "0",
+            },
+        )
+        self.assertEqual(rtx.parameters, {"apt": 110})
+        self.assertIn("a=rtpmap:110 H265/90000\r\n", str(parsed))
+        self.assertIn(
+            "a=fmtp:110 profile-id=1;tier-flag=0;level-id=60;"
+            "tx-mode=SRST;sprop-max-don-diff=0\r\n",
+            str(parsed),
+        )
 
 
 class H265PayloadTest(TestCase):
@@ -125,6 +305,15 @@ class H265PayloadTest(TestCase):
             [b"\x60\x01" + b"\x00\x03\x40\x01a" * 20],
         )
 
+    def test_vcl_temporal_layers_are_not_mixed(self) -> None:
+        for units in (
+            [b"\x40\x01a", b"\x02\x03b"],
+            [b"\x02\x03a", b"\x40\x01b"],
+            [b"\x02\x01a", b"\x02\x03b"],
+        ):
+            with self.subTest(units=units):
+                self.assertEqual(H265Encoder._packetize(units), units)
+
     def test_split_bitstream(self) -> None:
         self.assertEqual(
             list(
@@ -144,7 +333,14 @@ class H265PayloadTest(TestCase):
 
 class H265Test(CodecTestCase):
     def test_decoder_junk(self) -> None:
-        self.assertEqual(H265Decoder().decode(JitterFrame(b"123", 0)), [])
+        for data in (
+            b"123",
+            b"\x00\x00\x00\x01\x26\x01a",
+            b"\x00\x00\x00\x01\x40\x01a",
+            b"\x00\x00\x00\x01\xff" * 5,
+        ):
+            with self.subTest(data=data):
+                self.assertEqual(H265Decoder().decode(JitterFrame(data, 0)), [])
 
     def test_roundtrip(self) -> None:
         for width, height in ((320, 240), (640, 480), (960, 540), (1280, 720)):
@@ -214,6 +410,8 @@ class H265Test(CodecTestCase):
             else:
                 self.assertTrue(types.issuperset({32, 33, 34}))
                 self.assertTrue(types.intersection({19, 20}))
+                ordered_types = [u[0] >> 1 for u in H265Encoder._split_bitstream(data)]
+                self.assertEqual(ordered_types[:3], [32, 33, 34])
                 self.assertTrue(frames[0].key_frame)
                 fresh_frames = H265Decoder().decode(JitterFrame(data, timestamp))
                 self.assertEqual(len(fresh_frames), 1)
@@ -229,11 +427,37 @@ class H265Test(CodecTestCase):
         with self.assertRaises(ValueError):
             encoder.pack(self.create_packet(b"not Annex B", 0))
 
+    def test_rgb24_roundtrip(self) -> None:
+        encoder = H265Encoder()
+        frame = self.create_video_frame(320, 240, 0, format="rgb24")
+        for plane in frame.planes:
+            plane.update(b"\xff\x00\x00" * (plane.buffer_size // 3))
+        payloads, timestamp = encoder.encode(frame, force_keyframe=True)
+        self.assertTrue(payloads)
+        self.assertEqual(timestamp, 0)
+        data = b"".join(map(h265_depayload, payloads))
+        frames = H265Decoder().decode(JitterFrame(data, timestamp))
+        self.assertEqual(len(frames), 1)
+        assert isinstance(frames[0], av.VideoFrame)
+        self.assertEqual(
+            (frames[0].width, frames[0].height, frames[0].pts), (320, 240, 0)
+        )
+        self.assertTrue(frames[0].key_frame)
+        pixel = frames[0].to_ndarray(format="rgb24")[120, 160]
+        self.assertGreaterEqual(int(pixel[0]), 240)
+        self.assertLessEqual(int(pixel[1]), 10)
+        self.assertLessEqual(int(pixel[2]), 10)
+
     def test_level_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            H265Encoder(level_id=120)
         encoder = H265Encoder(level_id=30)
         self.assertEqual(encoder.target_bitrate, 128000)
         encoder.target_bitrate = 3000000
         self.assertEqual(encoder.target_bitrate, 128000)
+        level2_encoder = H265Encoder(level_id=60)
+        level2_encoder.target_bitrate = 3000000
+        self.assertEqual(level2_encoder.target_bitrate, 1500000)
         with self.assertRaises(ValueError):
             encoder.encode(self.create_video_frame(640, 480, 0))
         payloads, timestamp = encoder.encode(self.create_video_frame(128, 96, 0))
@@ -256,3 +480,22 @@ class H265Test(CodecTestCase):
                 self.assertRaises(ValueError),
             ):
                 H265Encoder().encode(self.create_video_frame(width, height, 0))
+
+    def test_signaled_profile_tier_and_level(self) -> None:
+        for level, width, height in (
+            (30, 128, 96),
+            (60, 320, 240),
+            (63, 640, 360),
+            (90, 640, 480),
+            (93, 1280, 720),
+        ):
+            with self.subTest(level=level):
+                encoder = H265Encoder(level_id=level)
+                payloads, _ = encoder.encode(self.create_video_frame(width, height, 0))
+                data = b"".join(map(h265_depayload, payloads))
+                units = list(H265Encoder._split_bitstream(data))
+                sps = next(u for u in units if u[0] >> 1 == 33)
+                rbsp = sps[2:].replace(b"\x00\x00\x03", b"\x00\x00")
+                self.assertEqual(rbsp[1] & 0xE0, 0)
+                self.assertEqual(rbsp[1] & 0x1F, 1)
+                self.assertEqual(rbsp[12], level)
