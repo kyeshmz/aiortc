@@ -5,6 +5,12 @@ from aiortc.jitterbuffer import JitterBuffer
 from aiortc.rtp import RtpPacket
 
 
+class DepayloadedRtpPacket(RtpPacket):
+    def __init__(self, sequence_number: int, timestamp: int, data: bytes) -> None:
+        super().__init__(sequence_number=sequence_number, timestamp=timestamp)
+        self._data: bytes = data
+
+
 class JitterBufferTest(TestCase):
     def assertPackets(
         self, jbuffer: JitterBuffer, expected: list[Optional[int]]
@@ -249,8 +255,9 @@ class JitterBufferTest(TestCase):
             with self.subTest(count=count):
                 jbuffer = JitterBuffer(capacity=4, prefetch=4)
                 for sequence, timestamp in ((0, 100), (1, 100), (2, 200), (3, 200)):
-                    packet = RtpPacket(sequence_number=sequence, timestamp=timestamp)
-                    packet._data = b"payload"  # type: ignore
+                    packet = DepayloadedRtpPacket(
+                        sequence_number=sequence, timestamp=timestamp, data=b"payload"
+                    )
                     self.assertEqual(jbuffer.add(packet), (False, None))
 
                 self.assertIs(jbuffer.smart_remove(count), cleared)
@@ -266,10 +273,11 @@ class JitterBufferTest(TestCase):
                     (1, 100, b"b"),
                     (3, 200, b"retained"),
                 ):
-                    packet = RtpPacket(
-                        sequence_number=(start + offset) % 65536, timestamp=timestamp
+                    packet = DepayloadedRtpPacket(
+                        sequence_number=(start + offset) % 65536,
+                        timestamp=timestamp,
+                        data=data,
                     )
-                    packet._data = data  # type: ignore
                     self.assertEqual(jbuffer.add(packet), (False, None))
 
                 self.assertFalse(jbuffer.smart_remove(1))
@@ -279,8 +287,9 @@ class JitterBufferTest(TestCase):
                     [retained],
                 )
 
-                packet = RtpPacket(sequence_number=next_sequence, timestamp=300)
-                packet._data = b"next"  # type: ignore
+                packet = DepayloadedRtpPacket(
+                    sequence_number=next_sequence, timestamp=300, data=b"next"
+                )
                 pli_flag, frame = jbuffer.add(packet)
                 self.assertFalse(pli_flag)
                 self.assertIsNotNone(frame)
