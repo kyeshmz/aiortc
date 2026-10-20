@@ -112,15 +112,13 @@ class JitterBuffer:
         to prevent sending corrupted frames to the decoder.
         """
         timestamp = None
-        for i in range(self._capacity):
-            pos = self._origin % self._capacity
-            packet = self._packets[pos]
+        for index in range(self._capacity):
+            position = self._origin % self._capacity
+            packet = self._packets[position]
             if packet is not None:
-                if i >= count and timestamp != packet.timestamp:
-                    break
+                if index >= count and timestamp != packet.timestamp:
+                    return False
                 timestamp = packet.timestamp
-            self._packets[pos] = None
+            self._packets[position] = None
             self._origin = uint16_add(self._origin, 1)
-            if i == self._capacity - 1:
-                return True
-        return False
+        return True

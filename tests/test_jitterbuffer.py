@@ -235,6 +235,79 @@ class JitterBufferTest(TestCase):
         self.assertEqual(jbuffer._origin, 3)
         self.assertPackets(jbuffer, [None, None, None, 3])
 
+    def test_smart_remove_count_boundaries(self) -> None:
+        cases: list[tuple[int, bool, int, list[Optional[int]]]] = [
+            (0, False, 0, [0, 1, 2, 3]),
+            (1, False, 2, [None, None, 2, 3]),
+            (2, False, 2, [None, None, 2, 3]),
+            (3, True, 4, [None, None, None, None]),
+            (4, True, 4, [None, None, None, None]),
+            (5, True, 4, [None, None, None, None]),
+            (100, True, 4, [None, None, None, None]),
+        ]
+        for count, cleared, origin, packets in cases:
+            with self.subTest(count=count):
+                jbuffer = JitterBuffer(capacity=4, prefetch=4)
+                for sequence, timestamp in ((0, 100), (1, 100), (2, 200), (3, 200)):
+                    packet = RtpPacket(sequence_number=sequence, timestamp=timestamp)
+                    packet._data = b"payload"  # type: ignore
+                    self.assertEqual(jbuffer.add(packet), (False, None))
+
+                self.assertIs(jbuffer.smart_remove(count), cleared)
+                self.assertEqual(jbuffer._origin, origin)
+                self.assertPackets(jbuffer, packets)
+
+    def test_smart_remove_retains_complete_frame(self) -> None:
+        for start, retained, next_sequence in ((0, 3, 4), (65534, 1, 2), (65535, 2, 3)):
+            with self.subTest(start=start):
+                jbuffer = JitterBuffer(capacity=4)
+                for offset, timestamp, data in (
+                    (0, 100, b"a"),
+                    (1, 100, b"b"),
+                    (3, 200, b"retained"),
+                ):
+                    packet = RtpPacket(
+                        sequence_number=(start + offset) % 65536, timestamp=timestamp
+                    )
+                    packet._data = data  # type: ignore
+                    self.assertEqual(jbuffer.add(packet), (False, None))
+
+                self.assertFalse(jbuffer.smart_remove(1))
+                self.assertEqual(jbuffer._origin, retained)
+                self.assertEqual(
+                    [x.sequence_number for x in jbuffer._packets if x is not None],
+                    [retained],
+                )
+
+                packet = RtpPacket(sequence_number=next_sequence, timestamp=300)
+                packet._data = b"next"  # type: ignore
+                pli_flag, frame = jbuffer.add(packet)
+                self.assertFalse(pli_flag)
+                self.assertIsNotNone(frame)
+                self.assertEqual(frame.timestamp, 200)
+                self.assertEqual(frame.data, b"retained")
+
+    def test_smart_remove_clears_sparse_window(self) -> None:
+        for start, cleared_origin, empty_origin in ((0, 4, 8), (65534, 2, 6)):
+            with self.subTest(start=start):
+                jbuffer = JitterBuffer(capacity=4)
+                for offset in (0, 2):
+                    self.assertEqual(
+                        jbuffer.add(
+                            RtpPacket(
+                                sequence_number=(start + offset) % 65536, timestamp=100
+                            )
+                        ),
+                        (False, None),
+                    )
+
+                self.assertTrue(jbuffer.smart_remove(1))
+                self.assertEqual(jbuffer._origin, cleared_origin)
+                self.assertPackets(jbuffer, [None, None, None, None])
+                self.assertTrue(jbuffer.smart_remove(0))
+                self.assertEqual(jbuffer._origin, empty_origin)
+                self.assertPackets(jbuffer, [None, None, None, None])
+
     def test_remove_audio_frame(self) -> None:
         """
         Audio jitter buffer.
