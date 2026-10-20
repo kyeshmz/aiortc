@@ -55,16 +55,33 @@ def object_to_string(obj: _SignalingObject) -> str:
 
 class BaseSignaling(ABC):
     @abstractmethod
-    async def connect(self) -> None: ...
+    async def connect(self) -> None:
+        """Prepare signaling resources without requiring a remote peer connection.
+
+        Socket providers may defer opening sockets until send or receive.
+        """
 
     @abstractmethod
-    async def close(self) -> None: ...
+    async def close(self) -> None:
+        """Release local signaling resources.
+
+        Providers may send BYE without awaiting transport shutdown or confirming
+        remote receipt.
+        """
 
     @abstractmethod
-    async def send(self, descr: _SignalingObject) -> None: ...
+    async def send(self, descr: _SignalingObject) -> None:
+        """Serialize a session description, ICE candidate, or BYE through the provider.
+
+        Completion does not acknowledge receipt by the remote party.
+        """
 
     @abstractmethod
-    async def receive(self) -> Optional[_SignalingObject]: ...
+    async def receive(self) -> Optional[_SignalingObject]:
+        """Read provider input and parse a signaling object.
+
+        End-of-input handling depends on the provider.
+        """
 
 
 class CopyAndPasteSignaling(BaseSignaling):
