@@ -373,6 +373,38 @@ class H265Test(CodecTestCase):
                             decoded[0].time_base, fractions.Fraction(1, 90000)
                         )
 
+    def test_roundtrip_source_timestamps(self) -> None:
+        for time_base, source_pts, expected_timestamps in (
+            (
+                fractions.Fraction(1, 90000),
+                [0, 3600, 7200, 10800],
+                [0, 3600, 7200, 10800],
+            ),
+            (
+                fractions.Fraction(1, 9000),
+                [91, 466, 841, 1216],
+                [910, 4660, 8410, 12160],
+            ),
+        ):
+            with self.subTest(time_base=time_base, source_pts=source_pts):
+                encoder = H265Encoder()
+                decoder = H265Decoder()
+                timestamps = []
+                decoded_pts = []
+                for pts in source_pts:
+                    frame = self.create_video_frame(320, 240, pts, time_base=time_base)
+                    payloads, timestamp = encoder.encode(frame)
+                    self.assertTrue(payloads)
+                    timestamps.append(timestamp)
+                    decoded = decoder.decode(
+                        JitterFrame(b"".join(map(h265_depayload, payloads)), timestamp)
+                    )
+                    self.assertEqual(len(decoded), 1)
+                    decoded_pts.append(decoded[0].pts)
+                    self.assertEqual(decoded[0].time_base, fractions.Fraction(1, 90000))
+                self.assertEqual(timestamps, expected_timestamps)
+                self.assertEqual(decoded_pts, expected_timestamps)
+
     def test_keyframes_bitrate_and_resolution(self) -> None:
         encoder = H265Encoder()
         decoder = H265Decoder()

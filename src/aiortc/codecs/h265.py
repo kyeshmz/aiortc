@@ -268,11 +268,11 @@ class H265Encoder(Encoder):
                 ),
             }
 
-        data = b"".join(bytes(packet) for packet in self.codec.encode(frame))
         time_base = fractions.Fraction(
             frame.time_base.numerator, frame.time_base.denominator
         )
         timestamp = convert_timebase(frame.pts, time_base, VIDEO_TIME_BASE)
+        data = b"".join(bytes(packet) for packet in self.codec.encode(frame))
         return self._packetize(self._split_bitstream(data)) if data else [], timestamp
 
     def pack(self, packet: Packet) -> tuple[list[bytes], int]:
