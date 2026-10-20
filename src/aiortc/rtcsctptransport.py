@@ -913,6 +913,13 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         for chunk in chunks:
             await self._receive_chunk(chunk)
 
+        # Delivery markers only protect skips while a receive gap remains.
+        self._inbound_stream_last_delivered_tsn = {
+            stream_id: tsn
+            for stream_id, tsn in self._inbound_stream_last_delivered_tsn.items()
+            if uint32_gt(tsn, self._last_received_tsn)
+        }
+
         if self._reconfig_reset_pending is not None and uint32_gte(
             self._last_received_tsn, self._reconfig_reset_pending.last_tsn
         ):
@@ -994,14 +1001,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         messages = list(stream.pop_messages())
         if messages:
             remaining = {chunk.tsn for chunk in stream.reassembly}
-            last_tsn = self._inbound_stream_last_delivered_tsn.get(stream_id)
             for chunk in chunks:
                 if chunk.tsn not in remaining and not (
                     chunk.flags & SCTP_DATA_UNORDERED
                 ):
-                    if last_tsn is None or uint32_gt(chunk.tsn, last_tsn):
-                        last_tsn = chunk.tsn
-                        self._inbound_stream_last_delivered_tsn[stream_id] = last_tsn
+                    self._inbound_stream_last_delivered_tsn[stream_id] = chunk.tsn
         return messages
 
     async def _receive_chunk(self, chunk: Chunk) -> None:
@@ -1725,9 +1729,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._sent_queue.append(self._outbound_queue.popleft())
 
         while self._sent_queue and self._sent_queue[0]._abandoned:
-            # Old skips must not cross a reset boundary before its response.
-            if self._reconfig_request is not None and uint32_gt(
-                self._sent_queue[0].tsn, self._reconfig_request.last_tsn
+            # Retained skips cannot cross an unacknowledged reset boundary.
+            if (
+                self._reconfig_request is not None
+                and uint32_gt(self._reconfig_request.last_tsn, self._last_sacked_tsn)
+                and uint32_gt(self._sent_queue[0].tsn, self._reconfig_request.last_tsn)
             ):
                 break
             chunk = self._sent_queue.popleft()
