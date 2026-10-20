@@ -5032,6 +5032,184 @@ a=rtpmap:0 PCMU/8000
                         await pc.close()
 
     @asynctest
+    async def test_connect_video_omitted_direction(self) -> None:
+        for phase in ("offer", "answer", "pranswer"):
+            with self.subTest(phase=phase):
+                offerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                answerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                try:
+                    for pc in (offerer, answerer):
+                        pc.addTrack(VideoStreamTrack())
+                        pc.getTransceivers()[0].setCodecPreferences(
+                            [
+                                c
+                                for c in RTCRtpSender.getCapabilities("video").codecs
+                                if c.mimeType in ("video/H265", "video/rtx")
+                            ]
+                        )
+                    offer = await offerer.createOffer()
+                    if phase == "offer":
+                        offer = RTCSessionDescription(
+                            sdp=offer.sdp.replace("a=sendrecv\r\n", ""), type="offer"
+                        )
+                    await offerer.setLocalDescription(offer)
+                    await answerer.setRemoteDescription(offerer.localDescription)
+                    answer = await answerer.createAnswer()
+                    if phase != "offer":
+                        answer = RTCSessionDescription(
+                            sdp=answer.sdp.replace("a=sendrecv\r\n", ""), type=phase
+                        )
+                    await answerer.setLocalDescription(answer)
+                    await offerer.setRemoteDescription(answerer.localDescription)
+                    omitted = (
+                        offerer.localDescription
+                        if phase == "offer"
+                        else answerer.localDescription
+                    )
+                    self.assertIsNone(
+                        SessionDescription.parse(omitted.sdp).media[0].direction
+                    )
+                    for pc in (offerer, answerer):
+                        transceiver = pc.getTransceivers()[0]
+                        self.assertEqual(transceiver.currentDirection, "sendrecv")
+                        self.assertIs(transceiver.sender._enabled, True)
+                        self.assertIs(transceiver.receiver._enabled, True)
+                    frames = await asyncio.gather(
+                        asyncio.wait_for(offerer.getReceivers()[0].track.recv(), 10),
+                        asyncio.wait_for(answerer.getReceivers()[0].track.recv(), 10),
+                    )
+                    for frame in frames:
+                        assert isinstance(frame, VideoFrame)
+                        self.assertEqual((frame.width, frame.height), (640, 480))
+                    if phase == "pranswer":
+                        self.assertEqual(offerer.signalingState, "have-remote-pranswer")
+                        self.assertEqual(answerer.signalingState, "have-local-pranswer")
+                        await answerer.setLocalDescription(
+                            RTCSessionDescription(
+                                sdp=answerer.localDescription.sdp, type="answer"
+                            )
+                        )
+                        await offerer.setRemoteDescription(answerer.localDescription)
+                    for pc in (offerer, answerer):
+                        self.assertEqual(pc.signalingState, "stable")
+                        self.assertEqual(pc.connectionState, "connected")
+                        self.assertEqual(
+                            pc.getTransceivers()[0].currentDirection, "sendrecv"
+                        )
+                finally:
+                    await asyncio.gather(offerer.close(), answerer.close())
+
+    @asynctest
+    async def test_connect_video_session_direction(self) -> None:
+        cases = (
+            ("offer", "sendrecv", False, "sendrecv", "sendrecv"),
+            ("offer", "sendonly", False, "sendonly", "recvonly"),
+            ("offer", "recvonly", False, "recvonly", "sendonly"),
+            ("offer", "inactive", False, "inactive", "inactive"),
+            ("offer", "inactive", True, "sendrecv", "sendrecv"),
+            ("answer", "sendrecv", False, "sendrecv", "sendrecv"),
+            ("answer", "sendonly", False, "recvonly", "sendonly"),
+            ("answer", "recvonly", False, "sendonly", "recvonly"),
+            ("answer", "inactive", False, "inactive", "inactive"),
+            ("answer", "inactive", True, "sendrecv", "sendrecv"),
+        )
+        flags = {
+            "sendrecv": (True, True),
+            "sendonly": (True, False),
+            "recvonly": (False, True),
+            "inactive": (False, False),
+        }
+        for (
+            phase,
+            session_direction,
+            override,
+            offerer_direction,
+            answerer_direction,
+        ) in cases:
+            with self.subTest(
+                phase=phase, session_direction=session_direction, override=override
+            ):
+                offerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                answerer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+
+                def inherit_direction(
+                    description: RTCSessionDescription,
+                ) -> RTCSessionDescription:
+                    session_sdp, media_sdp = description.sdp.split("m=", 1)
+                    if not override:
+                        media_sdp = re.sub(
+                            "^a=(sendrecv|sendonly|recvonly|inactive)\r\n",
+                            "",
+                            media_sdp,
+                            flags=re.M,
+                        )
+                    return RTCSessionDescription(
+                        sdp=session_sdp + f"a={session_direction}\r\nm=" + media_sdp,
+                        type=description.type,
+                    )
+
+                try:
+                    offerer.addTrack(VideoStreamTrack())
+                    answerer.addTrack(VideoStreamTrack())
+                    channel = offerer.createDataChannel("directions")
+                    messages: list[Union[str, bytes]] = []
+
+                    @answerer.on("datachannel")
+                    def on_datachannel(remote: RTCDataChannel) -> None:
+                        remote.on("message", messages.append)
+
+                    offer = await offerer.createOffer()
+                    await offerer.setLocalDescription(
+                        inherit_direction(offer) if phase == "offer" else offer
+                    )
+                    await answerer.setRemoteDescription(
+                        inherit_direction(offerer.localDescription)
+                        if phase == "offer"
+                        else offerer.localDescription
+                    )
+                    answer = await answerer.createAnswer()
+                    self.assertEqual(
+                        SessionDescription.parse(answer.sdp).media[0].direction,
+                        answerer_direction if phase == "offer" else "sendrecv",
+                    )
+                    await answerer.setLocalDescription(
+                        inherit_direction(answer) if phase == "answer" else answer
+                    )
+                    await offerer.setRemoteDescription(
+                        inherit_direction(answerer.localDescription)
+                        if phase == "answer"
+                        else answerer.localDescription
+                    )
+                    receiving = []
+                    for pc, direction in (
+                        (offerer, offerer_direction),
+                        (answerer, answerer_direction),
+                    ):
+                        transceiver = pc.getTransceivers()[0]
+                        self.assertEqual(transceiver.currentDirection, direction)
+                        self.assertEqual(
+                            (
+                                transceiver.sender._enabled,
+                                transceiver.receiver._enabled,
+                            ),
+                            flags[direction],
+                        )
+                        self.assertEqual(pc.signalingState, "stable")
+                        if direction in ("recvonly", "sendrecv"):
+                            receiving.append(
+                                asyncio.wait_for(transceiver.receiver.track.recv(), 10)
+                            )
+                    for frame in await asyncio.gather(*receiving):
+                        assert isinstance(frame, VideoFrame)
+                        self.assertEqual((frame.width, frame.height), (640, 480))
+                    await self.assertDataChannelOpen(channel)
+                    channel.send("direction-independent")
+                    await self.sleepWhile(lambda: not messages)
+                    self.assertEqual(messages, ["direction-independent"])
+                finally:
+                    await asyncio.gather(offerer.close(), answerer.close())
+
+    @asynctest
     async def test_connect_video_pranswer(self) -> None:
         for role in ("client", "server"):
             with self.subTest(role=role):

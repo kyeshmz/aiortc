@@ -23,6 +23,27 @@ from .utils import lf2crlf
 class SdpTest(TestCase):
     maxDiff = None
 
+    def test_direction_inheritance_and_media_override(self) -> None:
+        for direction, expected in (
+            (None, [None, "recvonly", "sendrecv", None]),
+            ("sendrecv", ["sendrecv", "recvonly", "sendrecv", "sendrecv"]),
+            ("sendonly", ["sendonly", "recvonly", "sendrecv", "sendonly"]),
+            ("recvonly", ["recvonly", "recvonly", "sendrecv", "recvonly"]),
+            ("inactive", ["inactive", "recvonly", "sendrecv", "inactive"]),
+        ):
+            with self.subTest(direction=direction):
+                description = SessionDescription.parse(
+                    "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+                    + (f"a={direction}\r\n" if direction else "")
+                    + "m=audio 9 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                    "m=audio 9 RTP/AVP 0\r\na=recvonly\r\na=rtpmap:0 PCMU/8000\r\n"
+                    "m=video 9 RTP/AVP 96\r\na=sendrecv\r\na=rtpmap:96 VP8/90000\r\n"
+                    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+                )
+                self.assertEqual([m.direction for m in description.media], expected)
+                roundtrip = SessionDescription.parse(str(description))
+                self.assertEqual([m.direction for m in roundtrip.media], expected)
+
     def test_ignored_media_fields_and_empty_groups(self) -> None:
         description = SessionDescription.parse(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
