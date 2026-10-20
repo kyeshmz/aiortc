@@ -11,6 +11,7 @@ from aiortc.rtcdtlstransport import (
     RTCDtlsParameters,
     RTCDtlsTransport,
     RtpRouter,
+    State,
 )
 from aiortc.rtcrtpparameters import (
     RTCRtpCodecParameters,
@@ -34,7 +35,13 @@ from aiortc.rtp import (
 )
 from OpenSSL import SSL
 
-from .utils import asynctest, dummy_ice_transport_pair, load, set_loss_pattern
+from .utils import (
+    asynctest,
+    dummy_dtls_transport_pair,
+    dummy_ice_transport_pair,
+    load,
+    set_loss_pattern,
+)
 
 RTP = load("rtp.bin")
 RTCP = load("rtcp_sr.bin")
@@ -178,13 +185,64 @@ class RTCDtlsTransportTest(TestCase):
             session2.start(session1.getLocalParameters()),
         )
 
-        # send encypted data
-        await session1._send_data(b"ping")
-        await asyncio.sleep(0.1)
+        try:
+            with self.assertLogs("aiortc.rtcdtlstransport", level="WARNING") as logs:
+                await session1._send_data(b"ping")
+                with self.assertRaisesRegex(Exception, "^some error$"):
+                    await asyncio.wait_for(session2._task, timeout=1)
+            self.assertEqual(session2.state, "closed")
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("Traceback (most recent call last):", logs.output[0])
+            self.assertIn("Exception: some error", logs.output[0])
+        finally:
+            await session1.stop()
+            await session2.stop()
 
-        # shutdown
-        await session1.stop()
-        await session2.stop()
+    @asynctest
+    async def test_stop_propagates_cancellation_without_warning(self) -> None:
+        async with dummy_dtls_transport_pair() as (session1, _):
+            states = []
+            session1.on("statechange", lambda: states.append(session1.state))
+            task = session1._task
+            with self.assertNoLogs("aiortc.rtcdtlstransport", level="WARNING"):
+                await session1.stop()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+            self.assertEqual(session1.state, "closed")
+            self.assertEqual(states, ["closed"])
+            await session1.stop()
+            session1._set_state(State.CLOSED)
+            self.assertEqual(states, ["closed"])
+
+    @asynctest
+    async def test_unsupported_fingerprint_and_datagrams_do_not_block_data(
+        self,
+    ) -> None:
+        transport1, transport2 = dummy_ice_transport_pair()
+        session1 = RTCDtlsTransport(transport1, [RTCCertificate.generateCertificate()])
+        session2 = RTCDtlsTransport(transport2, [RTCCertificate.generateCertificate()])
+        receiver = DummyDataReceiver()
+        session2._register_data_receiver(receiver)
+        parameters = session2.getLocalParameters()
+        parameters.fingerprints.insert(
+            0, RTCDtlsFingerprint(algorithm="unsupported", value="ignored")
+        )
+        try:
+            await asyncio.gather(
+                session1.start(parameters),
+                session2.start(session1.getLocalParameters()),
+            )
+            self.assertEqual(session1.state, "connected")
+            self.assertEqual(session2.state, "connected")
+            await transport1._send(b"\x00ignored")
+            await transport1._send(b"\xc0ignored")
+            await session1._send_data(b"still delivered")
+            await asyncio.sleep(0.1)
+            self.assertEqual(receiver.data, [b"still delivered"])
+            self.assertEqual(session2.state, "connected")
+        finally:
+            await session1.stop()
+            await session2.stop()
 
     @asynctest
     async def test_rtp(self) -> None:

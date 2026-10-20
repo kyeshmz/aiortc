@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from typing import Optional
 
 import aioice.ice
@@ -277,6 +278,23 @@ class RTCIceGathererTest(TestCase):
 
 
 class RTCIceTransportTest(TestCase):
+    @asynctest
+    async def test_repeated_state_does_not_repeat_event(self) -> None:
+        transport = RTCIceTransport(RTCIceGatherer(iceServers=[]))
+        states = []
+        transport.on("statechange", lambda: states.append(transport.state))
+        set_state: Callable[[str], None] = getattr(
+            transport, "_RTCIceTransport__setState"
+        )
+        set_state("new")
+        set_state("checking")
+        set_state("checking")
+        self.assertEqual(transport.state, "checking")
+        self.assertEqual(states, ["checking"])
+        await transport.stop()
+        self.assertEqual(transport.state, "closed")
+        self.assertEqual(states, ["checking", "closed"])
+
     def setUp(self) -> None:
         # save timers
         self.consent_failures = aioice.ice.CONSENT_FAILURES

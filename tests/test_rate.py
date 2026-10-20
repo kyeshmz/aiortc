@@ -950,6 +950,38 @@ class Stream:
 
 
 class RemoteBitrateEstimatorTest(TestCase):
+    def test_periodic_feedback_and_early_overuse_feedback(self) -> None:
+        estimator = RemoteBitrateEstimator()
+        stream = Stream(capacity=500000)
+        updates = []
+        for send_time, arrival_time, size in stream.generate_frames(130):
+            result = estimator.add(arrival_time, send_time, size, 1234)
+            if result is not None:
+                updates.append((arrival_time, result))
+        self.assertEqual(
+            updates,
+            [
+                (3090, (361000, [1234])),
+                (3623, (376116, [1234])),
+                (4157, (391895, [1234])),
+            ],
+        )
+
+        stream.capacity = 250000
+        overuse_updates = []
+        for send_time, arrival_time, size in stream.generate_frames(4):
+            result = estimator.add(arrival_time, send_time, size, 5678)
+            overuse_updates.append((arrival_time, result))
+        self.assertEqual(
+            overuse_updates,
+            [
+                (4381, None),
+                (4429, None),
+                (4477, (295800, [1234, 5678])),
+                (4525, (285600, [1234, 5678])),
+            ],
+        )
+
     def test_capacity_drop(self) -> None:
         estimator = RemoteBitrateEstimator()
         stream = Stream(capacity=500000)

@@ -21,11 +21,15 @@ from aiortc.rtp import (
     RTCP_PSFB_FIR,
     RTCP_PSFB_PLI,
     RTCP_RTPFB_NACK,
+    RtcpByePacket,
+    RtcpPacket,
     RtcpPsfbPacket,
     RtcpReceiverInfo,
     RtcpRrPacket,
     RtcpRtpfbPacket,
     RtcpSdesPacket,
+    RtcpSenderInfo,
+    RtcpSrPacket,
     RtpPacket,
     is_rtcp,
     pack_remb_fci,
@@ -53,6 +57,42 @@ class BuggyStreamTrack(MediaStreamTrack):
 
 
 class RTCRtpSenderTest(TestCase):
+    @asynctest
+    async def test_sender_report_without_cname(self) -> None:
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def capture(data: bytes) -> None:
+            await queue.put(data)
+
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            sender = RTCRtpSender("audio", local_transport)
+            sender._ssrc = 1234
+            with patch.object(local_transport, "_send_rtp", side_effect=capture):
+                try:
+                    await sender.send(RTCRtpSendParameters(codecs=[PCMU_CODEC]))
+                    data = await asyncio.wait_for(queue.get(), timeout=2)
+                    self.assertEqual(
+                        RtcpPacket.parse(data),
+                        [
+                            RtcpSrPacket(
+                                ssrc=1234,
+                                sender_info=RtcpSenderInfo(
+                                    ntp_timestamp=0,
+                                    rtp_timestamp=0,
+                                    packet_count=0,
+                                    octet_count=0,
+                                ),
+                            )
+                        ],
+                    )
+                finally:
+                    await sender.stop()
+                self.assertEqual(
+                    RtcpPacket.parse(queue.get_nowait()),
+                    [RtcpByePacket(sources=[1234])],
+                )
+                self.assertTrue(queue.empty())
+
     @asynctest
     async def test_feedback_only_changes_its_target_sender(self) -> None:
         encoder = Vp8Encoder()

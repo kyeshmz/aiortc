@@ -27,7 +27,15 @@ from aiortc.rtcrtpreceiver import (
     StreamStatistics,
     TimestampMapper,
 )
-from aiortc.rtp import RtcpPacket, RtpPacket
+from aiortc.rtp import (
+    RtcpPacket,
+    RtcpReceiverInfo,
+    RtcpRrPacket,
+    RtcpSdesPacket,
+    RtcpSenderInfo,
+    RtcpSrPacket,
+    RtpPacket,
+)
 from aiortc.stats import RTCStatsReport
 from aiortc.utils import uint16_add
 
@@ -355,6 +363,83 @@ class RTCRtpReceiverTest(CodecTestCase):
             pass
 
     @asynctest
+    async def test_receiver_reports_empty_interval_and_delay_bounds(self) -> None:
+        intervals: asyncio.Queue[float] = asyncio.Queue()
+        release: asyncio.Queue[None] = asyncio.Queue()
+
+        async def wait_interval(delay: float) -> None:
+            await intervals.put(delay)
+            await release.get()
+
+        async with create_receiver("audio") as receiver:
+            receiver._track = RemoteStreamTrack(kind="audio")
+            receiver._set_rtcp_ssrc(1234)
+            with (
+                patch("aiortc.rtcrtpreceiver.asyncio.sleep", side_effect=wait_interval),
+                patch("aiortc.rtcrtpreceiver.time.time", return_value=1000) as now,
+                patch.object(
+                    receiver.transport, "_send_rtp", new_callable=AsyncMock
+                ) as send,
+            ):
+                try:
+                    await receiver.receive(RTCRtpReceiveParameters(codecs=[PCMU_CODEC]))
+                    await asyncio.wait_for(intervals.get(), timeout=1)
+                    release.put_nowait(None)
+                    await asyncio.wait_for(intervals.get(), timeout=1)
+                    send.assert_not_awaited()
+
+                    await receiver._handle_rtp_packet(
+                        RtpPacket(payload_type=0, sequence_number=100, ssrc=5678),
+                        arrival_time_ms=0,
+                    )
+                    await receiver._handle_rtcp_packet(
+                        RtcpSrPacket(
+                            ssrc=5678,
+                            sender_info=RtcpSenderInfo(
+                                ntp_timestamp=0xE000123456780000,
+                                rtp_timestamp=0,
+                                packet_count=1,
+                                octet_count=0,
+                            ),
+                        )
+                    )
+                    for delay, expected_dlsr in [
+                        (-1, 0),
+                        (0, 0),
+                        (65536, 0),
+                        (65537, 0),
+                        (0.25, 16384),
+                        (65535.5, 0xFFFF8000),
+                    ]:
+                        with self.subTest(delay=delay):
+                            now.return_value = 1000 + delay
+                            release.put_nowait(None)
+                            await asyncio.wait_for(intervals.get(), timeout=1)
+                            send.assert_awaited_once()
+                            self.assertEqual(
+                                RtcpPacket.parse(send.await_args.args[0]),
+                                [
+                                    RtcpRrPacket(
+                                        ssrc=1234,
+                                        reports=[
+                                            RtcpReceiverInfo(
+                                                ssrc=5678,
+                                                fraction_lost=0,
+                                                packets_lost=0,
+                                                highest_sequence=100,
+                                                jitter=0,
+                                                lsr=0x12345678,
+                                                dlsr=expected_dlsr,
+                                            )
+                                        ],
+                                    )
+                                ],
+                            )
+                            send.reset_mock()
+                finally:
+                    await receiver.stop()
+
+    @asynctest
     async def test_rtp_and_rtcp(self) -> None:
         async with create_receiver("audio") as receiver:
             receiver._track = RemoteStreamTrack(kind="audio")
@@ -368,6 +453,16 @@ class RTCRtpReceiverTest(CodecTestCase):
                 packet.sequence_number += i
                 packet.timestamp += i * 160
                 await receiver._handle_rtp_packet(packet, arrival_time_ms=i * 20)
+
+            await receiver._handle_rtcp_packet(RtcpSdesPacket())
+            ignored_report = await receiver.getStats()
+            self.assertEqual(
+                sorted(s.type for s in ignored_report.values()),
+                ["inbound-rtp", "transport"],
+            )
+            self.assertEqual(
+                ignored_report["inbound-rtp_" + str(id(receiver))].packetsReceived, 10
+            )
 
             # receive RTCP SR
             for rtcp_packet in RtcpPacket.parse(load("rtcp_sr.bin")):
