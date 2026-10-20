@@ -223,6 +223,25 @@ class RtcpPacketTest(TestCase):
             ],
         )
 
+    def test_sdes_serializes_each_source_with_end_and_alignment(self) -> None:
+        packet = RtcpSdesPacket(
+            chunks=[
+                rtp.RtcpSourceInfo(ssrc=1, items=[(1, b"abc")]),
+                rtp.RtcpSourceInfo(ssrc=2, items=[(1, b"z")]),
+            ]
+        )
+        data = bytes.fromhex("82ca00050000000101036162630000000000000201017a00")
+        self.assertEqual(bytes(packet), data)
+        self.assertEqual(RtcpPacket.parse(bytes(packet)), [packet])
+
+    def test_sdes_single_source_encoding_is_unchanged(self) -> None:
+        packet = RtcpSdesPacket(
+            chunks=[rtp.RtcpSourceInfo(ssrc=1, items=[(1, b"abc")])]
+        )
+        data = bytes.fromhex("81ca0003000000010103616263000000")
+        self.assertEqual(bytes(packet), data)
+        self.assertEqual(RtcpPacket.parse(bytes(packet)), [packet])
+
     def test_sdes_empty_source_before_single_byte_end(self) -> None:
         data = bytes.fromhex("82ca000400000001000000000000000201017a00")
         self.assertEqual(
