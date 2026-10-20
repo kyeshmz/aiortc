@@ -7,6 +7,7 @@ import threading
 import time
 import wave
 from collections.abc import Iterator
+from itertools import chain
 from typing import Any, cast
 from unittest import TestCase
 from unittest.mock import AsyncMock, Mock, patch
@@ -484,6 +485,28 @@ class CaptureInputContainer:
         return getattr(self.__real, name)
 
 
+class MissingPtsInputContainer:
+    def __init__(self, real: av.container.InputContainer) -> None:
+        self.__real = real
+        self.__packets: Iterator[av.Packet] | None = None
+
+    def demux(self, *args: Any) -> Iterator[av.Packet]:
+        if self.__packets is None:
+            packets = self.__real.demux(*args)
+            first = next(packets)
+            untimed = av.Packet(bytes(first))
+            untimed.stream = first.stream
+            untimed.dts = first.dts
+            untimed.duration = first.duration
+            untimed.time_base = first.time_base
+            untimed.pts = None
+            self.__packets = chain((untimed, first), packets)
+        return self.__packets
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__real, name)
+
+
 class MediaPlayerInputTest(MediaTestCase):
     def create_capture_file(self, name: str, sizes: list[tuple[int, int]]) -> str:
         path = self.temporary_path(name)
@@ -502,6 +525,18 @@ class MediaPlayerInputTest(MediaTestCase):
                         container.mux(packet)
                 for packet in stream.encode(None):
                     container.mux(packet)
+        return path
+
+    def create_opus_file(self, name: str) -> str:
+        path = self.temporary_path(name)
+        with av.open(path, "w") as output:
+            stream = output.add_stream("libopus", rate=48000)
+            assert isinstance(stream, av.AudioStream)
+            for frame in self.create_audio_frames("mono", 48000, 5):
+                for packet in stream.encode(frame):
+                    output.mux(packet)
+            for packet in stream.encode(None):
+                output.mux(packet)
         return path
 
     async def receive_video(self, track: MediaStreamTrack) -> list[int]:
@@ -528,16 +563,7 @@ class MediaPlayerInputTest(MediaTestCase):
 
     @asynctest
     async def test_compressed_audio_only_eof(self) -> None:
-        path = self.temporary_path("test.ogg")
-        with av.open(path, "w") as output:
-            stream = output.add_stream("libopus", rate=48000)
-            assert isinstance(stream, av.AudioStream)
-            for frame in self.create_audio_frames("mono", 48000, 5):
-                for packet in stream.encode(frame):
-                    output.mux(packet)
-            for packet in stream.encode(None):
-                output.mux(packet)
-
+        path = self.create_opus_file("test.ogg")
         threads = set(threading.enumerate())
         with av.open(path, "r") as container:
             with patch("av.open", return_value=container):
@@ -553,6 +579,45 @@ class MediaPlayerInputTest(MediaTestCase):
                         assert isinstance(media, av.Packet)
                         self.assertGreater(media.size, 0)
                         self.assertEqual(media.stream.codec_context.name, "opus")
+                        self.assertEqual(media.time_base, fractions.Fraction(1, 48000))
+                        timestamps.append(media.pts)
+                        for decoded_frame in media.decode():
+                            assert isinstance(decoded_frame, av.AudioFrame)
+                            self.assertEqual(decoded_frame.sample_rate, 48000)
+                            samples += decoded_frame.samples
+                    with self.assertRaises(MediaStreamError):
+                        await asyncio.wait_for(player.audio.recv(), timeout=1)
+                self.assertEqual(timestamps, [-312, 648, 1608, 2568, 3528, 4488])
+                self.assertEqual(samples, 4800)
+                self.assertEqual(player.audio.readyState, "ended")
+                with self.assertRaises(MediaStreamError):
+                    await player.audio.recv()
+                with self.assertRaisesRegex(AssertionError, "^Container is not open$"):
+                    next(container.demux())
+            finally:
+                player.audio.stop()
+        self.assertEqual(set(threading.enumerate()) - threads, set())
+
+    @asynctest
+    async def test_compressed_audio_skips_packet_without_pts(self) -> None:
+        path = self.create_opus_file("missing-pts.ogg")
+        threads = set(threading.enumerate())
+        with av.open(path, "r") as container:
+            boundary = MissingPtsInputContainer(container)
+            with patch("av.open", return_value=boundary):
+                player = MediaPlayer(path, decode=False)
+            self.assertIsNone(player.video)
+            assert player.audio is not None
+            try:
+                timestamps = []
+                samples = 0
+                with self.assertNoLogs("aiortc.contrib.media", level="WARNING"):
+                    for _ in range(6):
+                        media = await asyncio.wait_for(player.audio.recv(), timeout=1)
+                        assert isinstance(media, av.Packet)
+                        self.assertIs(media.stream, container.streams.audio[0])
+                        self.assertEqual(media.stream.codec_context.name, "opus")
+                        self.assertGreater(media.size, 0)
                         self.assertEqual(media.time_base, fractions.Fraction(1, 48000))
                         timestamps.append(media.pts)
                         for decoded_frame in media.decode():
