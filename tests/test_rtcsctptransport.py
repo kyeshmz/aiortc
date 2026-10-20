@@ -3,7 +3,7 @@ import contextlib
 from collections.abc import AsyncGenerator, Generator
 from typing import TypeVar, cast
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiortc.exceptions import InvalidStateError
 from aiortc.rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
@@ -650,6 +650,9 @@ class SctpStreamTest(TestCase):
         self.assertEqual(stream.prune_chunks(101), 3)
         self.assertEqual(stream.reassembly, [chunks[2]])
         self.assertEqual(stream.sequence_number, 2)
+        self.assertEqual(stream.prune_chunks(102), 3)
+        self.assertEqual(stream.reassembly, [])
+        self.assertEqual(stream.prune_chunks(102), 0)
 
 
 class SctpUtilTest(TestCase):
@@ -667,6 +670,84 @@ class SctpUtilTest(TestCase):
 
 
 class RTCSctpTransportTest(TestCase):
+    @asynctest
+    async def test_close_multiple_channels_repeatedly(self) -> None:
+        async with client_and_server() as (client, server):
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            channels = [
+                RTCDataChannel(client, RTCDataChannelParameters(label=label))
+                for label in ("first", "second")
+            ]
+            await asyncio.sleep(0.1)
+            self.assertEqual(
+                [channel.readyState for channel in channels], ["open", "open"]
+            )
+            closed = [asyncio.Event(), asyncio.Event()]
+            for channel, event in zip(channels, closed):
+                channel.on("close", event.set)
+                channel.close()
+                channel.close()
+            await asyncio.gather(
+                *(asyncio.wait_for(event.wait(), 1) for event in closed)
+            )
+            self.assertEqual(
+                [channel.readyState for channel in channels], ["closed", "closed"]
+            )
+            for channel in channels:
+                channel.close()
+
+    @asynctest
+    async def test_duplicate_ack_and_unknown_channel_control(self) -> None:
+        async with client_and_server() as (client, server):
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            await wait_for_outcome(client, server)
+            channel = RTCDataChannel(client, RTCDataChannelParameters(label="chat"))
+            opened = MagicMock()
+            channel.on("open", opened)
+            await asyncio.sleep(0.1)
+            self.assertEqual(channel.readyState, "open")
+            opened.assert_called_once_with()
+            for sequence, control in enumerate((b"\x02", b"\xff"), start=1):
+                chunk = DataChunk(flags=SCTP_DATA_FIRST_FRAG | SCTP_DATA_LAST_FRAG)
+                chunk.tsn = tsn_plus_one(client._last_received_tsn)
+                chunk.stream_id = channel.id
+                chunk.stream_seq = sequence
+                chunk.protocol = 50
+                chunk.user_data = control
+                await client._handle_data(
+                    serialize_packet(
+                        server.port, client.port, client._local_verification_tag, chunk
+                    )
+                )
+            self.assertEqual(channel.readyState, "open")
+            opened.assert_called_once_with()
+
+    @asynctest
+    async def test_expired_unordered_message_advances_tsn_without_stream_sequence(
+        self,
+    ) -> None:
+        async with client_standalone() as client:
+            client._local_tsn = 1
+            client._last_sacked_tsn = 0
+            client._advanced_peer_ack_tsn = 0
+            with patch.object(client, "_send_chunk", new_callable=AsyncMock) as send:
+                await client._send(
+                    123, 456, b"expired", max_retransmits=0, ordered=False
+                )
+                self.assertEqual(outstanding_tsns(client), [1])
+                client._t3_cancel()
+                client._t3_expired()
+                await asyncio.sleep(0)
+                self.assertEqual(outstanding_tsns(client), [])
+                self.assertEqual(send.await_count, 2)
+                forward = send.await_args_list[1].args[0]
+                self.assertIsInstance(forward, ForwardTsnChunk)
+                self.assertEqual(forward.cumulative_tsn, 1)
+                self.assertEqual(forward.streams, [])
+
     @contextlib.contextmanager
     def assertTimerPreserved(self, client: RTCSctpTransport) -> Generator[None]:
         previous_timer = client._t3_handle
@@ -1717,6 +1798,13 @@ class RTCSctpTransportTest(TestCase):
             self.assertEqual(received, [(456, 123, b"corge"), (456, 123, b"grault")])
             received.clear()
             client._sack_needed = False
+
+            chunk = ForwardTsnChunk()
+            chunk.cumulative_tsn = 108
+            await client._receive_chunk(chunk)
+            self.assertEqual(client._last_received_tsn, 108)
+            self.assertEqual(client._sack_misordered, set())
+            self.assertEqual(received, [])
 
     @asynctest
     async def test_receive_heartbeat(self) -> None:
