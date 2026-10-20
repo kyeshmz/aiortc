@@ -44,12 +44,12 @@ class SdpTest(TestCase):
                 roundtrip = SessionDescription.parse(str(description))
                 self.assertEqual([m.direction for m in roundtrip.media], expected)
 
-    def test_ignored_fields_and_empty_groups(self) -> None:
+    def test_ignored_media_fields_and_empty_groups(self) -> None:
         description = SessionDescription.parse(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
             "a=group:\r\na=msid-semantic:\r\n"
             "a=sendonly\r\na=x-ignored:session-value\r\n"
-            "m=audio 9 RTP/AVP 0\r\nb=AS:128\r\n"
+            "m=audio 9 RTP/AVP 0\r\nc=IN IP4 192.0.2.1\r\nb=AS:128\r\n"
             "a=rtpmap:0 PCMU/8000\r\na=ssrc:1 cname:sender\r\n"
             "a=ssrc:1 unknown:value\r\n"
         )
@@ -58,6 +58,7 @@ class SdpTest(TestCase):
         self.assertEqual(len(description.media), 1)
         self.assertEqual(description.media[0].kind, "audio")
         self.assertEqual(description.media[0].port, 9)
+        self.assertEqual(description.media[0].host, "192.0.2.1")
         self.assertEqual(description.media[0].profile, "RTP/AVP")
         self.assertEqual(description.media[0].fmt, [0])
         self.assertEqual(description.media[0].direction, "sendonly")

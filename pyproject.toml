@@ -51,6 +51,7 @@ documentation = "https://aiortc.readthedocs.io/"
 exclude_lines = ["pragma: no cover"]
 
 [tool.coverage.run]
+branch = true
 source = ["aiortc"]
 
 [tool.mypy]
