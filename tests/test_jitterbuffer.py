@@ -13,6 +13,11 @@ class JitterBufferTest(TestCase):
         self.assertEqual(found, expected)
 
     def test_create(self) -> None:
+        jbuffer = JitterBuffer(capacity=1)
+        self.assertEqual(jbuffer.capacity, 1)
+        self.assertEqual(jbuffer._packets, [None])
+        self.assertEqual(jbuffer._origin, None)
+
         jbuffer = JitterBuffer(capacity=2)
         self.assertEqual(jbuffer._packets, [None, None])
         self.assertEqual(jbuffer._origin, None)
@@ -20,6 +25,18 @@ class JitterBufferTest(TestCase):
         jbuffer = JitterBuffer(capacity=4)
         self.assertEqual(jbuffer._packets, [None, None, None, None])
         self.assertEqual(jbuffer._origin, None)
+
+    def test_create_zero_capacity(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "^capacity must be a power of 2$"):
+            JitterBuffer(capacity=0)
+
+    def test_create_invalid_capacity(self) -> None:
+        for capacity in (-2, -1, 3, 6):
+            with self.subTest(capacity=capacity):
+                with self.assertRaisesRegex(
+                    AssertionError, "^capacity must be a power of 2$"
+                ):
+                    JitterBuffer(capacity=capacity)
 
     def test_add_ordered(self) -> None:
         jbuffer = JitterBuffer(capacity=4)
